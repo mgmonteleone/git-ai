@@ -8,10 +8,14 @@
 //!
 //! ## Autodetection
 //!
-//! Dispatch is purely shape-based, never config/env/flag-based:
+//! Dispatch is purely shape-based, never config/env/flag-based, and is
+//! decided by KEY PRESENCE (a JSON `null` counts as absent), never by the
+//! discriminator's value type:
 //!   - `hook_event_name` present, `hook_type` absent → v1 (see below)
 //!   - `hook_type` present, `hook_event_name` absent → v2 (see below)
 //!   - both present, or neither present → `PresetError` (never guess)
+//!   - once routed, a present-but-non-string discriminator (e.g. a stray
+//!     number/object) is a `PresetError` too, not a silent fallback
 //!
 //! ## v1 (`auggie`) protocol
 //!
@@ -179,11 +183,21 @@ impl AgentPreset for AugmentPreset {
         // Autodetect the protocol generation from payload shape alone
         // (never from config/env/flags) so one preset serves both `auggie`
         // (v1) and `auggie-v2` (v2) with zero installer changes.
-        let has_v1_shape = data
-            .get("hook_event_name")
-            .and_then(|v| v.as_str())
-            .is_some();
-        let has_v2_shape = data.get("hook_type").and_then(|v| v.as_str()).is_some();
+        //
+        // Detection is by KEY PRESENCE, not by value type (CSS-2302): a
+        // payload carrying both `hook_event_name` and `hook_type` is
+        // ambiguous regardless of whether one of them holds a non-string
+        // value (e.g. a stray `"hook_event_name":123`). Silently treating a
+        // type-confused discriminator as "absent" would let such a payload
+        // slip past the ambiguous-shape rejection and misroute to a single
+        // generation instead of failing closed. A JSON `null` is the one
+        // exception: it is the conventional way to say "not provided" and
+        // is treated as absent, same as the key being missing entirely.
+        // Once routed, parse_v1/parse_v2 separately validate that their
+        // discriminator is actually a string (not just present) and return
+        // a clear PresetError otherwise -- never silence.
+        let has_v1_shape = data.get("hook_event_name").is_some_and(|v| !v.is_null());
+        let has_v2_shape = data.get("hook_type").is_some_and(|v| !v.is_null());
 
         match (has_v1_shape, has_v2_shape) {
             (true, false) => parse_v1(&data, trace_id),
@@ -200,10 +214,38 @@ impl AgentPreset for AugmentPreset {
     }
 }
 
+/// Human-readable JSON value type name for actionable type-mismatch errors
+/// (e.g. "a stray discriminator must be a string, got number") (CSS-2302).
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// Parses the v1 (`auggie`) hook payload shape. See the module docs for the
 /// full schema.
 fn parse_v1(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
     {
+        // `hook_event_name` is known to be present (non-null) here -- that's
+        // what routed us to parse_v1 -- but presence alone doesn't mean it's
+        // a string. Validate the type explicitly so a type-confused value
+        // (e.g. a stray number/object) fails closed with an actionable
+        // error instead of silently falling through as "unsupported event"
+        // (CSS-2302).
+        if let Some(v) = data.get("hook_event_name")
+            && v.as_str().is_none()
+        {
+            return Err(GitAiError::PresetError(format!(
+                "Augment hook_event_name must be a string, got {}",
+                json_type_name(v)
+            )));
+        }
+
         let conversation_id = parse::required_str(data, "conversation_id")?.to_string();
 
         // workspace_roots is required; use the first entry as the canonical cwd.
@@ -349,6 +391,20 @@ fn extract_post_file_paths(data: &serde_json::Value, workspace_root: &str) -> Ve
 /// module docs for the full schema and the MVP session/model derivation
 /// strategy.
 fn parse_v2(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
+    // `hook_type` is known to be present (non-null) here -- that's what
+    // routed us to parse_v2 -- but presence alone doesn't mean it's a
+    // string. Validate the type explicitly so a type-confused value (e.g. a
+    // stray number/object) fails closed with an actionable error instead of
+    // silently falling through as "unsupported hook_type" (CSS-2302).
+    if let Some(v) = data.get("hook_type")
+        && v.as_str().is_none()
+    {
+        return Err(GitAiError::PresetError(format!(
+            "Augment hook_type must be a string, got {}",
+            json_type_name(v)
+        )));
+    }
+
     let hook_type = parse::optional_str(data, "hook_type");
     let tool_name = parse::optional_str(data, "tool_name");
 
@@ -1352,28 +1408,64 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // Both-keys type-confusion matrix (CSS-2302 review blocker)
+    //
+    // Detection is by KEY PRESENCE, not value type: once BOTH
+    // `hook_event_name` and `hook_type` are present (non-null), the payload
+    // is ambiguous regardless of which one (or both) holds a non-string
+    // value. Silently ignoring a type-confused discriminator and treating it
+    // as "absent" is exactly the bug this matrix guards against -- it would
+    // let a payload carrying both keys slip past the ambiguous-shape
+    // rejection and misroute to a single generation instead of failing
+    // closed.
+    // ========================================================================
+
     #[test]
-    fn test_augment_hook_event_name_wrong_type_number_routes_as_v2() {
-        // A non-string hook_event_name (e.g. a stray number) must not count
-        // as v1 shape and must not trigger the ambiguous-shape error.
+    fn test_augment_both_keys_number_and_string_is_ambiguous() {
+        // Regression for the exact review repro: a stray non-string
+        // hook_event_name alongside a valid hook_type must still be
+        // rejected as ambiguous, not misrouted to v2.
         let input = json!({
-            "hook_event_name": 12345,
+            "hook_event_name": 123,
             "hook_type": "PostToolUse",
-            "tool_name": "bash",
-            "tool_input": {"command": "ls"},
+            "conversation_id": "conv-1",
+            "workspace_roots": ["/tmp/proj"],
+            "tool_name": "write",
+            "tool_input": {"path": "src/lib.rs"},
         })
         .to_string();
-        let events = AugmentPreset.parse(&input, "t_test").unwrap();
-        match &events[0] {
-            ParsedHookEvent::PostBashCall(_) => {}
-            _ => panic!("Expected PostBashCall (v2 route)"),
+        let result = AugmentPreset.parse(&input, "t_test");
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(msg.contains("Ambiguous"), "got: {}", msg);
+            }
+            other => panic!("Expected ambiguous-shape PresetError, got: {:?}", other),
         }
     }
 
     #[test]
-    fn test_augment_hook_type_wrong_type_object_routes_as_v1() {
-        // A non-string hook_type (e.g. a stray object) must not count as v2
-        // shape and must not trigger the ambiguous-shape error.
+    fn test_augment_both_keys_string_and_number_is_ambiguous() {
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "hook_type": 999,
+            "conversation_id": "conv-1",
+            "workspace_roots": ["/tmp/proj"],
+            "tool_name": "write",
+            "tool_input": {"path": "a.rs"},
+        })
+        .to_string();
+        let result = AugmentPreset.parse(&input, "t_test");
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(msg.contains("Ambiguous"), "got: {}", msg);
+            }
+            other => panic!("Expected ambiguous-shape PresetError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_augment_both_keys_string_and_object_is_ambiguous() {
         let input = json!({
             "hook_event_name": "PreToolUse",
             "hook_type": {"nested": true},
@@ -1383,10 +1475,100 @@ mod tests {
             "tool_input": {"path": "a.rs"},
         })
         .to_string();
-        let events = AugmentPreset.parse(&input, "t_test").unwrap();
-        match &events[0] {
-            ParsedHookEvent::PreFileEdit(_) => {}
-            _ => panic!("Expected PreFileEdit (v1 route)"),
+        let result = AugmentPreset.parse(&input, "t_test");
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(msg.contains("Ambiguous"), "got: {}", msg);
+            }
+            other => panic!("Expected ambiguous-shape PresetError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_augment_both_keys_object_and_string_is_ambiguous() {
+        let input = json!({
+            "hook_event_name": {"x": 1},
+            "hook_type": "PreToolUse",
+            "tool_name": "write",
+            "tool_input": {"path": "a.rs"},
+        })
+        .to_string();
+        let result = AugmentPreset.parse(&input, "t_test");
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(msg.contains("Ambiguous"), "got: {}", msg);
+            }
+            other => panic!("Expected ambiguous-shape PresetError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_augment_both_keys_bool_and_string_is_ambiguous() {
+        let input = json!({
+            "hook_event_name": true,
+            "hook_type": "PostToolUse",
+            "tool_name": "bash",
+            "tool_input": {"command": "ls"},
+        })
+        .to_string();
+        let result = AugmentPreset.parse(&input, "t_test");
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(msg.contains("Ambiguous"), "got: {}", msg);
+            }
+            other => panic!("Expected ambiguous-shape PresetError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_augment_hook_type_present_wrong_type_single_key_errors_not_silent() {
+        // Single-key case: hook_event_name is absent (JSON null), hook_type
+        // is present but not a string. This must reach parse_v2's own
+        // discriminator-type validation and fail closed with an actionable
+        // message -- not silently fall through as "unsupported hook_type".
+        let input = json!({
+            "hook_event_name": null,
+            "hook_type": 42,
+            "tool_name": "write",
+            "tool_input": {"path": "a.rs"},
+        })
+        .to_string();
+        let result = AugmentPreset.parse(&input, "t_test");
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(
+                    msg.contains("hook_type") && msg.contains("string"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected a type-confusion PresetError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_augment_hook_event_name_present_wrong_type_single_key_errors_not_silent() {
+        // Symmetric single-key case: hook_type is absent (JSON null),
+        // hook_event_name is present but not a string.
+        let input = json!({
+            "hook_event_name": 42,
+            "hook_type": null,
+            "conversation_id": "conv-1",
+            "workspace_roots": ["/tmp/proj"],
+            "tool_name": "write",
+            "tool_input": {"path": "a.rs"},
+        })
+        .to_string();
+        let result = AugmentPreset.parse(&input, "t_test");
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(
+                    msg.contains("hook_event_name") && msg.contains("string"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected a type-confusion PresetError, got: {:?}", other),
         }
     }
 
