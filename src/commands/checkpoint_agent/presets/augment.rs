@@ -77,8 +77,13 @@
 //! **Absent from the v2 JSON** (verified at the type level and live):
 //! `conversation_id`, `workspace_roots`, `context.modelName`, and any
 //! `file_changes[]` array — but `tool_input.path` is present on both
-//! Pre/PostToolUse, so the existing `parse::file_paths_from_tool_input`
-//! fallback (shared with other presets) already covers file resolution.
+//! Pre/PostToolUse, so the existing `extract_augment_file_paths` helper
+//! (shared with v1, which already handles `path` / `file_paths[]` /
+//! `apply_patch` patch text) already covers file resolution — including,
+//! for free, the hypothetical case of a future v2 extension sending the
+//! `apply_patch` tool name (classify_tool's `Agent::Augment` arm treats it
+//! as `FileEdit` for both shapes; v2's confirmed default toolset does not
+//! include it today).
 //!
 //! Everything the v1 preset needs is either present-but-renamed, or
 //! independently derivable without any cosmos-agent change:
@@ -395,8 +400,14 @@ fn parse_v2(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
                 ParsedHookEvent::PreFileEdit(PreFileEdit {
                     context,
                     // v2 has no file_changes[]; tool_input.path is present
-                    // on Pre/PostToolUse for both `write` and `edit`.
-                    file_paths: parse::file_paths_from_tool_input(data, &workspace_root),
+                    // on Pre/PostToolUse for both `write` and `edit`. Reuse
+                    // the v1 extractor (superset: path / file_paths[] /
+                    // apply_patch text) rather than the narrower cross-
+                    // preset helper, so that IF a future v2 extension ever
+                    // sends the classify_tool-shared "apply_patch" tool
+                    // name, its patch-text path is still resolved instead
+                    // of silently yielding zero file paths.
+                    file_paths: extract_augment_file_paths(data, &workspace_root),
                     dirty_files: None,
                     tool_use_id: None,
                 })
@@ -419,7 +430,11 @@ fn parse_v2(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
             } else if is_file_edit {
                 ParsedHookEvent::PostFileEdit(PostFileEdit {
                     context,
-                    file_paths: parse::file_paths_from_tool_input(data, &workspace_root),
+                    // Same extractor as PreToolUse above (superset of the
+                    // generic cross-preset helper); v2's real toolset has
+                    // no file_changes[], so tool_input.path/apply_patch
+                    // text is the only source on Post as well as Pre.
+                    file_paths: extract_augment_file_paths(data, &workspace_root),
                     dirty_files: None,
                     stream_source: None,
                     tool_use_id: None,
@@ -1040,6 +1055,33 @@ mod tests {
                 assert!(e.stream_source.is_none());
             }
             _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_v2_apply_patch_hypothetical_extracts_path_from_patch_text() {
+        // Not part of v2's confirmed default toolset (read/bash/edit/write)
+        // -- but classify_tool's shared Agent::Augment arm would still
+        // route a hypothetical future "apply_patch" tool_name to FileEdit
+        // on the v2 path, and tool_input there has no "path", only a raw
+        // patch-format "input" string (v1's apply_patch shape). Guards
+        // against silently yielding zero file paths in that case.
+        let input = json!({
+            "hook_type": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"input": "*** Begin Patch\n*** Add File: hello.py\n+def greet():\n+    pass\n*** End Patch"},
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert!(
+                    e.file_paths[0].ends_with("hello.py"),
+                    "expected hello.py, got {:?}",
+                    e.file_paths
+                );
+            }
+            _ => panic!("Expected PreFileEdit"),
         }
     }
 
