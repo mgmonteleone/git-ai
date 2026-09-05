@@ -1,8 +1,22 @@
-//! Augment Code (Auggie CLI) preset.
+//! Augment Code preset — supports BOTH the v1 (`auggie`) and v2
+//! (`auggie-v2` / cosmos-agent) hook protocols, autodetected per-payload
+//! from its shape (CSS-2302). One preset registration serves both CLI
+//! generations with zero changes to either auggie or the installer
+//! (`mdm/agents/augment.rs`): both write hook commands to the same
+//! `~/.augment/settings.json`, and v2's config loader already accepts
+//! the shape the installer writes.
 //!
-//! Augment's hook protocol delivers a single-line UTF-8 JSON payload on
-//! stdin per the docs at <https://docs.augmentcode.com/cli/hooks>. The
-//! top-level fields are:
+//! ## Autodetection
+//!
+//! Dispatch is purely shape-based, never config/env/flag-based:
+//!   - `hook_event_name` present, `hook_type` absent → v1 (see below)
+//!   - `hook_type` present, `hook_event_name` absent → v2 (see below)
+//!   - both present, or neither present → `PresetError` (never guess)
+//!
+//! ## v1 (`auggie`) protocol
+//!
+//! Single-line UTF-8 JSON payload on stdin per
+//! <https://docs.augmentcode.com/cli/hooks>. Top-level fields:
 //!
 //!   - `hook_event_name` — `"PreToolUse"`, `"PostToolUse"`, `"SessionStart"`,
 //!     `"SessionEnd"`, `"Stop"`
@@ -24,10 +38,9 @@
 //!     creates instead of `save-file`)
 //!   - `launch-process` → bash (field: `tool_input.command`)
 //!
-//! Notably **absent** from the payload (verified against the public docs):
-//!   - `transcript_path` — Augment does not surface a transcript file
-//!   - `session_id` — Augment uses `conversation_id` instead
-//!   - `cwd` (scalar) — Augment uses `workspace_roots` array
+//! Notably **absent** from the v1 payload (verified against the public
+//! docs): `transcript_path`, scalar `cwd` (`workspace_roots` array is used
+//! instead), and `session_id` (`conversation_id` is used instead).
 //!
 //! Path resolution: `tool_input.path` is workspace-relative per the docs'
 //! jq examples; resolve against `workspace_roots[0]` to get an absolute
@@ -40,23 +53,73 @@
 //! event other than `PreToolUse`/`PostToolUse` with an explicit
 //! `PresetError`.
 //!
-//! Transcript reading: not implemented. Augment exposes
+//! Transcript reading: not implemented for v1. Augment exposes
 //! `conversation.agentCodeResponse[]` only on `Stop` when
 //! `metadata.includeConversationData` is enabled, but no on-disk
 //! transcript file is documented. `stream_source` is therefore set
-//! to `None`. Hook-based attribution still works without it; a
-//! dedicated reader can land in a follow-up PR.
+//! to `None`. Hook-based attribution still works without it.
+//!
+//! ## v2 (`auggie-v2` / cosmos-agent) protocol — MVP (CSS-2302)
+//!
+//! Confirmed live against the real `auggie-v2` binary (see
+//! `V2FeasibilityAssessment` in the CSS-2302 run). Payload shape
+//! (`packages/pi-extensions/hooks/types.ts` upstream):
+//!
+//!   - `hook_type` — `"PreToolUse"`, `"PostToolUse"`, `"SessionStart"`,
+//!     `"SessionEnd"`, `"Stop"`, `"Notification"`, `"PromptSubmit"`
+//!   - `tool_name` — generic Claude-Code-style names: `read`, `bash`,
+//!     `edit`, `write` (NOT Augment's v1 kebab-case names)
+//!   - `tool_input` — `{"path": ..., "content": ...}` (`write`),
+//!     `{"path": ..., "edits": [...]}` (`edit`), `{"command": ...}` (`bash`)
+//!   - `tool_result` / `tool_is_error` — PostToolUse only (v1's equivalent
+//!     fields are named `tool_output`/`tool_error`)
+//!
+//! **Absent from the v2 JSON** (verified at the type level and live):
+//! `conversation_id`, `workspace_roots`, `context.modelName`, and any
+//! `file_changes[]` array — but `tool_input.path` is present on both
+//! Pre/PostToolUse, so the existing `parse::file_paths_from_tool_input`
+//! fallback (shared with other presets) already covers file resolution.
+//!
+//! Everything the v1 preset needs is either present-but-renamed, or
+//! independently derivable without any cosmos-agent change:
+//!   - **Workspace root**: v2's hook subprocess inherits the already
+//!     `chdir`'d CLI process cwd, so `std::env::current_dir()` recovers it
+//!     for free (confirmed live) — simpler than v1's JSON field read.
+//!   - **Session id / model (MVP tier)**: best-effort mining of the
+//!     on-disk `~/.augment/sessions-v2/--<cwd-slug>--/*.jsonl` session
+//!     file (newest-mtime file for the workspace; header `id` for the
+//!     session id, tail-scanned `model_change`/message `model` for the
+//!     live model). This is undocumented internal file format, not a
+//!     contract — mining is strictly best-effort, bounded (newest file
+//!     only, tail-only read, never an unbounded scan), and NEVER blocks
+//!     or slows the parse path: any failure degrades to a stable
+//!     `generate_session_id(cwd, "augment")` hash and `model: "unknown"`,
+//!     mirroring the v1 preset's own missing-metadata fallback.
+//!   - **Tool classification**: v2's default toolset names happen to
+//!     coincide with Claude's (`write`/`edit`/`bash`) — added directly to
+//!     the existing `Agent::Augment` arm in `classify_tool` (no v1/v2
+//!     name collisions), not a documented guarantee (a future release or
+//!     an enabled extension could rename tools invisibly to git-ai).
+//!
+//! **Events not handled:** `SessionStart`, `SessionEnd`, `Stop`,
+//! `Notification`, `PromptSubmit` — rejected with `PresetError`, same
+//! fail-closed policy as v1 (never fabricate a checkpoint for a
+//! lifecycle event).
 
 use super::parse;
 use super::{
     AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
     PresetContext,
 };
+use crate::authorship::authorship_log_serialization::generate_session_id;
 use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 use crate::error::GitAiError;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 pub struct AugmentPreset;
 
@@ -108,7 +171,35 @@ impl AgentPreset for AugmentPreset {
         let data: serde_json::Value = serde_json::from_str(hook_input)
             .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
 
-        let conversation_id = parse::required_str(&data, "conversation_id")?.to_string();
+        // Autodetect the protocol generation from payload shape alone
+        // (never from config/env/flags) so one preset serves both `auggie`
+        // (v1) and `auggie-v2` (v2) with zero installer changes.
+        let has_v1_shape = data
+            .get("hook_event_name")
+            .and_then(|v| v.as_str())
+            .is_some();
+        let has_v2_shape = data.get("hook_type").and_then(|v| v.as_str()).is_some();
+
+        match (has_v1_shape, has_v2_shape) {
+            (true, false) => parse_v1(&data, trace_id),
+            (false, true) => parse_v2(&data, trace_id),
+            (true, true) => Err(GitAiError::PresetError(
+                "Ambiguous Augment hook_input: both hook_event_name (v1) and hook_type (v2) present"
+                    .to_string(),
+            )),
+            (false, false) => Err(GitAiError::PresetError(
+                "Unrecognized Augment hook_input: neither hook_event_name (v1) nor hook_type (v2) present"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+/// Parses the v1 (`auggie`) hook payload shape. See the module docs for the
+/// full schema.
+fn parse_v1(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
+    {
+        let conversation_id = parse::required_str(data, "conversation_id")?.to_string();
 
         // workspace_roots is required; use the first entry as the canonical cwd.
         let workspace_root = data
@@ -123,8 +214,8 @@ impl AgentPreset for AugmentPreset {
             })?
             .to_string();
 
-        let tool_name = parse::optional_str(&data, "tool_name");
-        let hook_event = parse::optional_str(&data, "hook_event_name");
+        let tool_name = parse::optional_str(data, "tool_name");
+        let hook_event = parse::optional_str(data, "hook_event_name");
         // Augment does not document a per-tool-call id field, so default
         // to "bash" for bash tools (matching the Claude/Codex pattern)
         // and "unknown" for file-edit events.
@@ -167,12 +258,12 @@ impl AgentPreset for AugmentPreset {
                     ParsedHookEvent::PreBashCall(PreBashCall {
                         context,
                         tool_use_id: "bash".to_string(),
-                        command: parse::bash_command_from_hook_input(&data),
+                        command: parse::bash_command_from_hook_input(data),
                     })
                 } else if is_file_edit {
                     ParsedHookEvent::PreFileEdit(PreFileEdit {
                         context,
-                        file_paths: extract_augment_file_paths(&data, &workspace_root),
+                        file_paths: extract_augment_file_paths(data, &workspace_root),
                         dirty_files: None,
                         tool_use_id: None,
                     })
@@ -188,7 +279,7 @@ impl AgentPreset for AugmentPreset {
                     ParsedHookEvent::PostBashCall(PostBashCall {
                         context,
                         tool_use_id: "bash".to_string(),
-                        command: parse::bash_command_from_hook_input(&data),
+                        command: parse::bash_command_from_hook_input(data),
                         // Transcript reader for Augment's conversation
                         // history is not yet implemented; setting None
                         // avoids feeding an unsupported format to the
@@ -200,9 +291,9 @@ impl AgentPreset for AugmentPreset {
                     // when Augment captured the actual mutation) over
                     // tool_input.path. Falling back to tool_input keeps
                     // us correct when file_changes is absent.
-                    let post_paths = extract_post_file_paths(&data, &workspace_root);
+                    let post_paths = extract_post_file_paths(data, &workspace_root);
                     let file_paths = if post_paths.is_empty() {
-                        extract_augment_file_paths(&data, &workspace_root)
+                        extract_augment_file_paths(data, &workspace_root)
                     } else {
                         post_paths
                     };
@@ -245,11 +336,255 @@ fn extract_post_file_paths(data: &serde_json::Value, workspace_root: &str) -> Ve
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// v2 (`auggie-v2` / cosmos-agent) parsing
+// ---------------------------------------------------------------------------
+
+/// Parses the v2 (`auggie-v2` / cosmos-agent) hook payload shape. See the
+/// module docs for the full schema and the MVP session/model derivation
+/// strategy.
+fn parse_v2(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
+    let hook_type = parse::optional_str(data, "hook_type");
+    let tool_name = parse::optional_str(data, "tool_name");
+
+    // v2 never sends workspace_roots; the hook subprocess's own cwd IS the
+    // workspace root (auggie-v2 chdirs there before running tools).
+    let workspace_root_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let workspace_root = workspace_root_path.to_string_lossy().to_string();
+
+    // v2's default toolset names coincide with Claude's; both are matched
+    // by the shared Agent::Augment arm in classify_tool.
+    let tool_class = tool_name
+        .map(|n| bash_tool::classify_tool(Agent::Augment, n))
+        .unwrap_or(ToolClass::Skip);
+    let is_bash = tool_class == ToolClass::Bash;
+    let is_file_edit = tool_class == ToolClass::FileEdit;
+
+    // MVP session id / model: best-effort session-file mining with a
+    // graceful, immediate degrade to a stable cwd-derived hash + "unknown"
+    // model on any miss. Mining never blocks or slows the parse path.
+    let mined = mine_v2_session_info(&workspace_root_path);
+    let session_id = mined
+        .session_id
+        .unwrap_or_else(|| generate_session_id(&workspace_root, "augment"));
+    let model = mined.model.unwrap_or_else(|| "unknown".to_string());
+
+    let context = PresetContext {
+        agent_id: AgentId {
+            tool: "augment".to_string(),
+            id: session_id.clone(),
+            model,
+        },
+        external_session_id: session_id,
+        trace_id: trace_id.to_string(),
+        cwd: workspace_root_path,
+        metadata: HashMap::new(),
+    };
+
+    // Same fail-closed policy as v1: explicit error on unknown/lifecycle
+    // events and unsupported tools, never a fabricated checkpoint.
+    let event = match hook_type {
+        Some("PreToolUse") => {
+            if is_bash {
+                ParsedHookEvent::PreBashCall(PreBashCall {
+                    context,
+                    tool_use_id: "bash".to_string(),
+                    command: parse::bash_command_from_hook_input(data),
+                })
+            } else if is_file_edit {
+                ParsedHookEvent::PreFileEdit(PreFileEdit {
+                    context,
+                    // v2 has no file_changes[]; tool_input.path is present
+                    // on Pre/PostToolUse for both `write` and `edit`.
+                    file_paths: parse::file_paths_from_tool_input(data, &workspace_root),
+                    dirty_files: None,
+                    tool_use_id: None,
+                })
+            } else {
+                return Err(GitAiError::PresetError(format!(
+                    "Skipping Augment v2 PreToolUse for unsupported tool {}",
+                    tool_name.unwrap_or("unknown")
+                )));
+            }
+        }
+        Some("PostToolUse") => {
+            if is_bash {
+                ParsedHookEvent::PostBashCall(PostBashCall {
+                    context,
+                    tool_use_id: "bash".to_string(),
+                    command: parse::bash_command_from_hook_input(data),
+                    // No documented v2 transcript file; same as v1.
+                    stream_source: None,
+                })
+            } else if is_file_edit {
+                ParsedHookEvent::PostFileEdit(PostFileEdit {
+                    context,
+                    file_paths: parse::file_paths_from_tool_input(data, &workspace_root),
+                    dirty_files: None,
+                    stream_source: None,
+                    tool_use_id: None,
+                })
+            } else {
+                return Err(GitAiError::PresetError(format!(
+                    "Skipping Augment v2 PostToolUse for unsupported tool {}",
+                    tool_name.unwrap_or("unknown")
+                )));
+            }
+        }
+        _ => {
+            return Err(GitAiError::PresetError(format!(
+                "Unsupported Augment v2 hook_type: {}",
+                hook_type.unwrap_or("<missing>")
+            )));
+        }
+    };
+
+    Ok(vec![event])
+}
+
+/// Best-effort result of mining the on-disk v2 session file. Either field
+/// may be `None` on any miss (dir/file not found, unreadable, malformed,
+/// etc.) — callers must degrade gracefully, never propagate an error.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MinedV2SessionInfo {
+    session_id: Option<String>,
+    model: Option<String>,
+}
+
+/// Bound on how much of a session file's tail we'll read to look for the
+/// most recent model info. Keeps the cost O(1) regardless of session
+/// length — never an unbounded scan.
+const V2_SESSION_TAIL_BYTES: u64 = 65536;
+
+/// Slugifies a workspace root the same way cosmos-agent's session manager
+/// does for its `sessions-v2/--<slug>--/` directory naming: strip the
+/// leading path separator, then replace remaining separators with `-`.
+/// Confirmed live against this VM's own `~/.augment/sessions-v2/` layout
+/// (see `V2FeasibilityAssessment`). Undocumented internal format, MVP-only.
+fn v2_workspace_slug(cwd: &str) -> String {
+    cwd.trim_start_matches(['/', '\\'])
+        .replace(['/', '\\'], "-")
+}
+
+/// Root directory v2 stores its agent state under, respecting the
+/// `AUGMENT_CACHE_DIR` env var override (the only override visible to a
+/// hook subprocess — a CLI-flag-only override is not, per the feasibility
+/// assessment). Falls back to `~/.augment`.
+fn v2_agent_dir() -> PathBuf {
+    std::env::var("AUGMENT_CACHE_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::mdm::utils::home_dir().join(".augment"))
+}
+
+/// Returns the newest-mtime `*.jsonl` file directly inside `dir`, or
+/// `None` if the directory is missing/empty/unreadable. Single,
+/// non-recursive directory listing — bounded by the (small) number of
+/// sessions for one workspace, not by any file's content size.
+fn latest_jsonl_in_dir(dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .max_by_key(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        })
+        .map(|e| e.path())
+}
+
+/// Reads at most the last `max_bytes` of `path`, lossily decoded as UTF-8.
+/// Returns `(tail, truncated)` where `truncated` indicates the read did
+/// not start at byte 0 (so the first returned line may be a partial line
+/// and should be discarded by the caller).
+fn read_tail(path: &Path, max_bytes: u64) -> Option<(String, bool)> {
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    Some((String::from_utf8_lossy(&buf).into_owned(), start > 0))
+}
+
+/// Scans a tail-read chunk backwards (most-recent-first) for the live
+/// model name, matching either a `model_change` event's `modelId` or a
+/// `message` entry's `model` field.
+fn extract_model_from_tail(tail: &str, truncated: bool) -> Option<String> {
+    let mut lines: Vec<&str> = tail.lines().collect();
+    if truncated && !lines.is_empty() {
+        // The first line of a tail-seeked read may be a partial line cut
+        // mid-JSON; drop it rather than risk a misleading parse.
+        lines.remove(0);
+    }
+
+    for line in lines.iter().rev() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let entry_type = value.get("type").and_then(|t| t.as_str());
+        if entry_type == Some("model_change")
+            && let Some(model_id) = value.get("modelId").and_then(|m| m.as_str())
+            && !model_id.is_empty()
+        {
+            return Some(model_id.to_string());
+        }
+        if entry_type == Some("message")
+            && let Some(model) = value.get("model").and_then(|m| m.as_str())
+            && !model.is_empty()
+        {
+            return Some(model.to_string());
+        }
+    }
+    None
+}
+
+/// Best-effort mining of `~/.augment/sessions-v2/--<cwd-slug>--/` for the
+/// current workspace's session id and live model name. Never fails loudly:
+/// any I/O error, missing directory, or malformed content simply yields
+/// `None` for the affected field. See the module docs for the full
+/// rationale and the MVP-vs-full-parity tradeoff.
+fn mine_v2_session_info(workspace_root: &Path) -> MinedV2SessionInfo {
+    let cwd_str = workspace_root.to_string_lossy();
+    let session_dir = v2_agent_dir()
+        .join("sessions-v2")
+        .join(format!("--{}--", v2_workspace_slug(&cwd_str)));
+
+    let Some(session_file) = latest_jsonl_in_dir(&session_dir) else {
+        return MinedV2SessionInfo::default();
+    };
+
+    // Bounded: read only the first line for the session header's `id`.
+    let session_id = fs::File::open(&session_file).ok().and_then(|f| {
+        let mut lines = BufReader::new(f).lines();
+        let first_line = lines.next()?.ok()?;
+        let value: serde_json::Value = serde_json::from_str(&first_line).ok()?;
+        if value.get("type").and_then(|t| t.as_str()) != Some("session") {
+            return None;
+        }
+        value
+            .get("id")
+            .and_then(|id| id.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    });
+
+    // Bounded: read only the tail for the most recent model info.
+    let model = read_tail(&session_file, V2_SESSION_TAIL_BYTES)
+        .and_then(|(tail, truncated)| extract_model_from_tail(&tail, truncated));
+
+    MinedV2SessionInfo { session_id, model }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::checkpoint_agent::presets::*;
     use serde_json::json;
+    use serial_test::serial;
+    use tempfile::TempDir;
 
     fn make_hook_input(event: &str, tool: &str, tool_input: serde_json::Value) -> String {
         json!({
@@ -593,6 +928,362 @@ mod tests {
                 assert_eq!(e.context.agent_id.model, "claude-sonnet-4-5");
             }
             _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    // ========================================================================
+    // v2 (`auggie-v2` / cosmos-agent) autodetection + parsing tests
+    //
+    // Fixtures below marked "[live]" are the exact payloads captured by
+    // running the real auggie-v2 binary, per V2FeasibilityAssessment
+    // (assessment.md §2) in the CSS-2302 run.
+    // ========================================================================
+
+    #[test]
+    fn test_augment_autodetects_v2_shape_from_hook_type() {
+        // [live] real captured PostToolUse write payload.
+        let input = r#"{"hook_type":"PostToolUse","tool_name":"write","tool_input":{"path":"/tmp/proj/bar2.txt","content":"test2"},"tool_result":[{"type":"text","text":"Successfully wrote 5 bytes to bar2.txt"}],"tool_is_error":false}"#;
+        let events = AugmentPreset.parse(input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => {
+                assert_eq!(e.context.agent_id.tool, "augment");
+                assert_eq!(e.file_paths, vec![PathBuf::from("/tmp/proj/bar2.txt")]);
+            }
+            _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_autodetects_v1_shape_from_hook_event_name() {
+        // v1 shape must still dispatch to parse_v1 even though v2 support
+        // now exists in the same preset.
+        let input = make_hook_input("PostToolUse", "save-file", json!({"path": "src/main.rs"}));
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => {
+                assert_eq!(e.context.agent_id.id, "conv-xyz789");
+            }
+            _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_ambiguous_shape_both_fields_present_errors() {
+        let input = json!({
+            "hook_event_name": "PostToolUse",
+            "hook_type": "PostToolUse",
+            "conversation_id": "conv-1",
+            "workspace_roots": ["/tmp/proj"],
+            "tool_name": "write",
+            "tool_input": {"path": "x"},
+        })
+        .to_string();
+        let result = AugmentPreset.parse(&input, "t_test");
+        assert!(result.is_err());
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(msg.contains("Ambiguous"), "got: {}", msg);
+            }
+            _ => panic!("Expected PresetError"),
+        }
+    }
+
+    #[test]
+    fn test_augment_neither_shape_field_present_errors() {
+        let input = json!({"tool_name": "write", "tool_input": {"path": "x"}}).to_string();
+        let result = AugmentPreset.parse(&input, "t_test");
+        assert!(result.is_err());
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(msg.contains("Unrecognized"), "got: {}", msg);
+            }
+            _ => panic!("Expected PresetError"),
+        }
+    }
+
+    #[test]
+    fn test_augment_v2_pre_write_extracts_path() {
+        // [live] real captured PreToolUse write payload (path made absolute
+        // for a deterministic assertion independent of the test process's
+        // actual cwd).
+        let input = r#"{"hook_type":"PreToolUse","tool_name":"write","tool_input":{"path":"/tmp/proj/bar2.txt","content":"test2"}}"#;
+        let events = AugmentPreset.parse(input, "t_test123456789a").unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.tool, "augment");
+                assert_eq!(e.context.trace_id, "t_test123456789a");
+                assert_eq!(e.file_paths, vec![PathBuf::from("/tmp/proj/bar2.txt")]);
+                assert!(e.dirty_files.is_none());
+                // No mining fixture is set up for this test's cwd, so the
+                // MVP fallback path must produce a stable, non-empty
+                // session id and default model.
+                assert!(!e.context.agent_id.id.is_empty());
+                assert_eq!(e.context.agent_id.model, "unknown");
+                assert!(!e.context.cwd.as_os_str().is_empty());
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_v2_post_edit_extracts_path() {
+        // [live] real captured PostToolUse edit payload (tool_is_error:
+        // true in the original capture -- still checkpointed the same as
+        // a successful edit; actual attribution is diff-based, so a
+        // failed edit that changed nothing produces no spurious lines).
+        let input = r#"{"hook_type":"PostToolUse","tool_name":"edit","tool_input":{"path":"/tmp/proj/bar2.txt","edits":[{"oldText":"a","newText":"b"}]},"tool_result":[{"type":"text","text":"error"}],"tool_is_error":true}"#;
+        let events = AugmentPreset.parse(input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => {
+                assert_eq!(e.file_paths, vec![PathBuf::from("/tmp/proj/bar2.txt")]);
+                assert!(e.stream_source.is_none());
+            }
+            _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_v2_read_tool_pretooluse_errors() {
+        // [live] real captured PreToolUse read payload -- read is
+        // intentionally not checkpointed (ToolClass::Skip).
+        let input =
+            r#"{"hook_type":"PreToolUse","tool_name":"read","tool_input":{"path":"foo.txt"}}"#;
+        let result = AugmentPreset.parse(input, "t_test");
+        assert!(result.is_err());
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(
+                    msg.contains("PreToolUse for unsupported tool"),
+                    "got: {}",
+                    msg
+                );
+            }
+            _ => panic!("Expected PresetError"),
+        }
+    }
+
+    #[test]
+    fn test_augment_v2_read_tool_posttooluse_errors() {
+        // [live] real captured PostToolUse read payload.
+        let input = r#"{"hook_type":"PostToolUse","tool_name":"read","tool_input":{"path":"foo.txt"},"tool_result":[{"type":"text","text":"hello world
+"}],"tool_is_error":false}"#;
+        let result = AugmentPreset.parse(input, "t_test");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_augment_v2_bash_tool_pre_and_post() {
+        let pre = json!({
+            "hook_type": "PreToolUse",
+            "tool_name": "bash",
+            "tool_input": {"command": "git status"},
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&pre, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreBashCall(e) => {
+                assert_eq!(e.context.agent_id.tool, "augment");
+                assert_eq!(e.tool_use_id, "bash");
+                assert_eq!(e.command.as_deref(), Some("git status"));
+            }
+            _ => panic!("Expected PreBashCall"),
+        }
+
+        let post = json!({
+            "hook_type": "PostToolUse",
+            "tool_name": "bash",
+            "tool_input": {"command": "git status"},
+            "tool_result": [{"type": "text", "text": "clean"}],
+            "tool_is_error": false,
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&post, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostBashCall(e) => {
+                assert_eq!(e.command.as_deref(), Some("git status"));
+                assert!(e.stream_source.is_none());
+            }
+            _ => panic!("Expected PostBashCall"),
+        }
+    }
+
+    #[test]
+    fn test_augment_v2_lifecycle_events_error() {
+        // [live] real captured minimal lifecycle payloads -- must not
+        // fall through to a fabricated checkpoint.
+        for payload in [
+            r#"{"hook_type":"SessionStart"}"#,
+            r#"{"hook_type":"SessionEnd"}"#,
+            r#"{"hook_type":"Stop"}"#,
+            r#"{"hook_type":"Notification","notification_type":"info","notification_message":"hi"}"#,
+            r#"{"hook_type":"PromptSubmit","user_prompt":"hello"}"#,
+        ] {
+            let result = AugmentPreset.parse(payload, "t_test");
+            assert!(result.is_err(), "expected error for {payload}, got Ok");
+            match result {
+                Err(GitAiError::PresetError(msg)) => {
+                    assert!(
+                        msg.contains("Unsupported Augment v2 hook_type"),
+                        "got: {}",
+                        msg
+                    );
+                }
+                _ => panic!("Expected PresetError"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_augment_v2_malformed_json_errors() {
+        let result = AugmentPreset.parse("not valid json", "t_test");
+        assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // v2 session-file mining (best-effort, bounded)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_v2_workspace_slug_strips_leading_slash_and_replaces_separators() {
+        assert_eq!(
+            v2_workspace_slug("/tmp/hooktest/workspace"),
+            "tmp-hooktest-workspace"
+        );
+        assert_eq!(v2_workspace_slug("/workspace"), "workspace");
+    }
+
+    #[test]
+    fn test_extract_model_from_tail_prefers_most_recent_model_change() {
+        let tail = "{\"type\":\"model_change\",\"modelId\":\"model-a\"}\n{\"type\":\"model_change\",\"modelId\":\"model-b\"}\n";
+        assert_eq!(
+            extract_model_from_tail(tail, false),
+            Some("model-b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_model_from_tail_falls_back_to_message_model() {
+        let tail = "{\"type\":\"message\",\"model\":\"prism_tenant_custom\"}\n";
+        assert_eq!(
+            extract_model_from_tail(tail, false),
+            Some("prism_tenant_custom".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_model_from_tail_discards_truncated_first_line() {
+        // Simulate a tail-seek landing mid-line: the first "line" is a
+        // partial fragment that must not be parsed as JSON.
+        let tail =
+            "\"modelId\":\"garbage\"}\n{\"type\":\"model_change\",\"modelId\":\"model-c\"}\n";
+        assert_eq!(
+            extract_model_from_tail(tail, true),
+            Some("model-c".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_model_from_tail_returns_none_when_absent() {
+        let tail = "{\"type\":\"session\",\"id\":\"abc\"}\n";
+        assert_eq!(extract_model_from_tail(tail, false), None);
+    }
+
+    #[test]
+    fn test_mine_v2_session_info_missing_dir_returns_defaults() {
+        let mined = mine_v2_session_info(Path::new("/nonexistent/workspace/for/this/test"));
+        assert_eq!(mined, MinedV2SessionInfo::default());
+    }
+
+    #[test]
+    #[serial]
+    fn test_mine_v2_session_info_reads_header_id_and_tail_model() {
+        let cache_dir = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let workspace_path = workspace.path().canonicalize().unwrap();
+        let slug = v2_workspace_slug(&workspace_path.to_string_lossy());
+        let session_dir = cache_dir
+            .path()
+            .join(".augment")
+            .join("sessions-v2")
+            .join(format!("--{}--", slug));
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_file = session_dir.join("4f2ba0-session.jsonl");
+        fs::write(
+            &session_file,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"real-session-id-123\",\"cwd\":\"{}\"}}\n{{\"type\":\"model_change\",\"provider\":\"anthropic\",\"modelId\":\"prism_tenant_custom\"}}\n",
+                workspace_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
+        }
+        let mined = mine_v2_session_info(&workspace_path);
+        unsafe {
+            std::env::remove_var("AUGMENT_CACHE_DIR");
+        }
+
+        assert_eq!(mined.session_id, Some("real-session-id-123".to_string()));
+        assert_eq!(mined.model, Some("prism_tenant_custom".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_mine_v2_session_info_picks_newest_mtime_file() {
+        let cache_dir = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let workspace_path = workspace.path().canonicalize().unwrap();
+        let slug = v2_workspace_slug(&workspace_path.to_string_lossy());
+        let session_dir = cache_dir
+            .path()
+            .join(".augment")
+            .join("sessions-v2")
+            .join(format!("--{}--", slug));
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let older = session_dir.join("older.jsonl");
+        fs::write(&older, "{\"type\":\"session\",\"id\":\"old-id\"}\n").unwrap();
+        // Ensure a distinguishable mtime ordering regardless of filesystem
+        // timestamp resolution.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newer = session_dir.join("newer.jsonl");
+        fs::write(&newer, "{\"type\":\"session\",\"id\":\"new-id\"}\n").unwrap();
+
+        unsafe {
+            std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
+        }
+        let mined = mine_v2_session_info(&workspace_path);
+        unsafe {
+            std::env::remove_var("AUGMENT_CACHE_DIR");
+        }
+
+        assert_eq!(mined.session_id, Some("new-id".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_augment_v2_falls_back_to_stable_session_id_when_mining_fails() {
+        let cache_dir = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
+        }
+        let input = r#"{"hook_type":"PreToolUse","tool_name":"write","tool_input":{"path":"/tmp/proj/x.txt"}}"#;
+        let events = AugmentPreset.parse(input, "t_test").unwrap();
+        unsafe {
+            std::env::remove_var("AUGMENT_CACHE_DIR");
+        }
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let expected_id = generate_session_id(&cwd.to_string_lossy(), "augment");
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.id, expected_id);
+                assert_eq!(e.context.agent_id.model, "unknown");
+            }
+            _ => panic!("Expected PreFileEdit"),
         }
     }
 }

@@ -363,3 +363,327 @@ fn test_augment_e2e_str_replace_editor_attribution() {
 
     assert!(!commit.authorship_log.attestations.is_empty());
 }
+
+// ============================================================================
+// v2 (`auggie-v2` / cosmos-agent) preset tests (CSS-2302)
+//
+// v2's hook payload uses `hook_type` (not `hook_event_name`), lowercase
+// Claude-Code-shaped tool names (`write`/`edit`/`bash`, not v1's kebab-case),
+// and never sends `workspace_roots` -- the workspace root is the hook
+// subprocess's own cwd, which `TestRepo::git_ai` sets via
+// `Command::current_dir(&self.path)`, so file paths below are workspace-
+// relative rather than absolute.
+// ============================================================================
+
+#[test]
+fn test_augment_v2_routes_write_to_post_file_edit() {
+    let hook_input = json!({
+        "hook_type": "PostToolUse",
+        "tool_name": "write",
+        "tool_input": {"path": "main.rs", "content": "fn main() {}"},
+        "tool_result": [{"type": "text", "text": "Successfully wrote 12 bytes to main.rs"}],
+        "tool_is_error": false,
+    })
+    .to_string();
+    let events = parse_augment(&hook_input).unwrap();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ParsedHookEvent::PostFileEdit(e) => {
+            assert_eq!(e.context.agent_id.tool, "augment");
+            assert_eq!(e.context.agent_id.model, "unknown");
+            assert!(
+                e.stream_source.is_none(),
+                "stream_source should be None until a v2 reader lands"
+            );
+            assert!(
+                e.file_paths[0].ends_with("main.rs"),
+                "expected main.rs, got {:?}",
+                e.file_paths
+            );
+        }
+        _ => panic!("Expected PostFileEdit"),
+    }
+}
+
+#[test]
+fn test_augment_v2_routes_edit_to_post_file_edit() {
+    let hook_input = json!({
+        "hook_type": "PostToolUse",
+        "tool_name": "edit",
+        "tool_input": {
+            "path": "lib.rs",
+            "edits": [{"oldText": "a", "newText": "b"}],
+        },
+        "tool_result": [{"type": "text", "text": "ok"}],
+        "tool_is_error": false,
+    })
+    .to_string();
+    let events = parse_augment(&hook_input).unwrap();
+    match &events[0] {
+        ParsedHookEvent::PostFileEdit(e) => {
+            assert!(e.file_paths[0].ends_with("lib.rs"));
+        }
+        _ => panic!("Expected PostFileEdit"),
+    }
+}
+
+#[test]
+fn test_augment_v2_routes_bash_to_bash_call() {
+    let pre = json!({
+        "hook_type": "PreToolUse",
+        "tool_name": "bash",
+        "tool_input": {"command": "git status"},
+    })
+    .to_string();
+    let events = parse_augment(&pre).unwrap();
+    match &events[0] {
+        ParsedHookEvent::PreBashCall(e) => {
+            assert_eq!(e.context.agent_id.tool, "augment");
+            assert_eq!(e.tool_use_id, "bash");
+            assert_eq!(e.command.as_deref(), Some("git status"));
+        }
+        _ => panic!("Expected PreBashCall"),
+    }
+
+    let post = json!({
+        "hook_type": "PostToolUse",
+        "tool_name": "bash",
+        "tool_input": {"command": "git status"},
+        "tool_result": [{"type": "text", "text": "clean"}],
+        "tool_is_error": false,
+    })
+    .to_string();
+    let events = parse_augment(&post).unwrap();
+    match &events[0] {
+        ParsedHookEvent::PostBashCall(e) => {
+            assert_eq!(e.context.agent_id.tool, "augment");
+            assert!(e.stream_source.is_none());
+        }
+        _ => panic!("Expected PostBashCall"),
+    }
+}
+
+#[test]
+fn test_augment_v2_rejects_lifecycle_events() {
+    for hook_type in [
+        "SessionStart",
+        "SessionEnd",
+        "Stop",
+        "Notification",
+        "PromptSubmit",
+    ] {
+        let payload = json!({"hook_type": hook_type}).to_string();
+        let result = parse_augment(&payload);
+        assert!(
+            result.is_err(),
+            "expected error for v2 lifecycle event {hook_type}, got Ok"
+        );
+    }
+}
+
+#[test]
+fn test_augment_v2_rejects_read_tool() {
+    // `read` is v2's default toolset name for a non-mutating tool; it must
+    // not be checkpointed (ToolClass::Skip), same fail-closed policy as
+    // v1's unsupported-tool rejection.
+    let payload = json!({
+        "hook_type": "PreToolUse",
+        "tool_name": "read",
+        "tool_input": {"path": "foo.txt"},
+    })
+    .to_string();
+    let result = parse_augment(&payload);
+    assert!(result.is_err(), "expected error for read tool, got Ok");
+}
+
+#[test]
+fn test_augment_v1_and_v2_shapes_are_never_confused() {
+    // A v1-shaped payload must never be routed through the v2 path (and
+    // vice versa) -- exercised end-to-end through the same preset
+    // instance to guard against any future shared-state regression.
+    let v1_input = json!({
+        "hook_event_name": "PostToolUse",
+        "conversation_id": "conv-mix-1",
+        "workspace_roots": ["/tmp/proj"],
+        "tool_name": "save-file",
+        "tool_input": {"path": "a.rs"},
+    })
+    .to_string();
+    let v2_input = json!({
+        "hook_type": "PostToolUse",
+        "tool_name": "write",
+        "tool_input": {"path": "b.rs"},
+    })
+    .to_string();
+
+    match &parse_augment(&v1_input).unwrap()[0] {
+        ParsedHookEvent::PostFileEdit(e) => {
+            assert_eq!(e.context.agent_id.id, "conv-mix-1");
+        }
+        _ => panic!("Expected PostFileEdit"),
+    }
+    match &parse_augment(&v2_input).unwrap()[0] {
+        ParsedHookEvent::PostFileEdit(e) => {
+            assert_ne!(e.context.agent_id.id, "conv-mix-1");
+        }
+        _ => panic!("Expected PostFileEdit"),
+    }
+}
+
+// ----------------------------------------------------------------------
+// End-to-end tests using TestRepo (v2 shape)
+// ----------------------------------------------------------------------
+
+#[test]
+fn test_augment_v2_e2e_write_attributes_to_augment() {
+    let repo = TestRepo::new();
+
+    let file_path = repo.path().join("app.py");
+    fs::write(&file_path, "def hello():\n    pass\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    fs::write(
+        &file_path,
+        "def hello():\n    pass\ndef world():\n    pass\n",
+    )
+    .unwrap();
+
+    // v2 never sends workspace_roots; `tool_input.path` is workspace-
+    // relative and resolved against the hook subprocess's own cwd, which
+    // `repo.git_ai` sets to `repo.path()`.
+    let hook_input = json!({
+        "hook_type": "PostToolUse",
+        "tool_name": "write",
+        "tool_input": {
+            "path": "app.py",
+            "content": "def hello():\n    pass\ndef world():\n    pass\n",
+        },
+        "tool_result": [{"type": "text", "text": "Successfully wrote 46 bytes to app.py"}],
+        "tool_is_error": false,
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "augment", "--hook-input", &hook_input])
+        .unwrap();
+
+    let commit = repo
+        .stage_all_and_commit("Add world function")
+        .expect("commit should succeed");
+
+    let mut file = repo.filename("app.py");
+    file.assert_lines_and_blame(crate::lines![
+        "def hello():".human(),
+        "    pass".human(),
+        "def world():".ai(),
+        "    pass".ai(),
+    ]);
+
+    assert!(
+        !commit.authorship_log.attestations.is_empty(),
+        "Should have AI attestations from Augment v2"
+    );
+    let session = commit
+        .authorship_log
+        .metadata
+        .sessions
+        .values()
+        .next()
+        .expect("session record should exist");
+    assert_eq!(session.agent_id.tool, "augment");
+    assert_eq!(
+        session.agent_id.model, "unknown",
+        "model defaults to 'unknown' when no v2 session file is mineable"
+    );
+}
+
+#[test]
+fn test_augment_v2_e2e_pre_then_post_isolates_human_lines() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("index.ts");
+    fs::write(&file_path, "console.log('hello');\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    let pre = json!({
+        "hook_type": "PreToolUse",
+        "tool_name": "write",
+        "tool_input": {
+            "path": "index.ts",
+            "content": "console.log('hello');\nconsole.log('from augment v2');\n",
+        },
+    })
+    .to_string();
+    repo.git_ai(&["checkpoint", "augment", "--hook-input", &pre])
+        .unwrap();
+
+    fs::write(
+        &file_path,
+        "console.log('hello');\nconsole.log('from augment v2');\n",
+    )
+    .unwrap();
+
+    let post = json!({
+        "hook_type": "PostToolUse",
+        "tool_name": "write",
+        "tool_input": {
+            "path": "index.ts",
+            "content": "console.log('hello');\nconsole.log('from augment v2');\n",
+        },
+        "tool_result": [{"type": "text", "text": "ok"}],
+        "tool_is_error": false,
+    })
+    .to_string();
+    repo.git_ai(&["checkpoint", "augment", "--hook-input", &post])
+        .unwrap();
+
+    let commit = repo
+        .stage_all_and_commit("Add augment v2 line")
+        .expect("commit should succeed");
+
+    let mut file = repo.filename("index.ts");
+    file.assert_lines_and_blame(crate::lines![
+        "console.log('hello');".human(),
+        "console.log('from augment v2');".ai(),
+    ]);
+
+    assert!(
+        !commit.authorship_log.attestations.is_empty(),
+        "Should have attestations"
+    );
+}
+
+#[test]
+fn test_augment_v2_e2e_edit_attribution() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("greet.py");
+    fs::write(&file_path, "def greet():\n    print('hi')\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    fs::write(&file_path, "def greet():\n    print('hello world')\n").unwrap();
+
+    let hook_input = json!({
+        "hook_type": "PostToolUse",
+        "tool_name": "edit",
+        "tool_input": {
+            "path": "greet.py",
+            "edits": [{"oldText": "print('hi')", "newText": "print('hello world')"}],
+        },
+        "tool_result": [{"type": "text", "text": "ok"}],
+        "tool_is_error": false,
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "augment", "--hook-input", &hook_input])
+        .unwrap();
+
+    let commit = repo
+        .stage_all_and_commit("Replace string via v2 edit")
+        .expect("commit should succeed");
+
+    let mut file = repo.filename("greet.py");
+    file.assert_lines_and_blame(crate::lines![
+        "def greet():".human(),
+        "    print('hello world')".ai(),
+    ]);
+
+    assert!(!commit.authorship_log.attestations.is_empty());
+}
