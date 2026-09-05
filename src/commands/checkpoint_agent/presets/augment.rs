@@ -549,21 +549,49 @@ fn v2_agent_dir() -> PathBuf {
         .unwrap_or_else(|| crate::mdm::utils::home_dir().join(".augment"))
 }
 
+/// Hard cap on directory entries `latest_jsonl_in_dir` will examine per
+/// call. A workspace's `sessions-v2/--<slug>--/` directory accumulates one
+/// file per historical session and is never pruned, so an unbounded
+/// `read_dir` + per-entry `metadata()` stat would make cost grow with a
+/// workspace's entire session history instead of staying O(1) per hook
+/// invocation. 512 comfortably covers realistic day-to-day session counts
+/// for a single workspace while still bounding worst-case work to a few
+/// hundred stats; if a directory has more entries than this, mining bails
+/// out (see below) rather than scan it.
+const V2_SESSION_DIR_SCAN_CAP: usize = 512;
+
 /// Returns the newest-mtime `*.jsonl` file directly inside `dir`, or
-/// `None` if the directory is missing/empty/unreadable. Single,
-/// non-recursive directory listing — bounded by the (small) number of
-/// sessions for one workspace, not by any file's content size.
+/// `None` if the directory is missing/empty/unreadable *or* holds more
+/// than `V2_SESSION_DIR_SCAN_CAP` entries. Single, non-recursive directory
+/// listing, bounded to constant work regardless of how many historical
+/// session files have accumulated for a workspace: once the cap is
+/// exceeded we give up and return `None` rather than let the scan scale
+/// with session history. Callers already degrade gracefully on `None`
+/// (regenerated session id + "unknown" model), so this is a safe fail-open
+/// in the "too many sessions" case.
 fn latest_jsonl_in_dir(dir: &Path) -> Option<PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
-    entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
-        .max_by_key(|e| {
-            e.metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH)
-        })
-        .map(|e| e.path())
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for (count, entry) in entries.enumerate() {
+        if count >= V2_SESSION_DIR_SCAN_CAP {
+            // Directory has more entries than we're willing to scan;
+            // bail out rather than let cost scale with session history.
+            return None;
+        }
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
+            newest = Some((modified, path));
+        }
+    }
+    newest.map(|(_, p)| p)
 }
 
 /// Reads at most the last `max_bytes` of `path`, lossily decoded as UTF-8.
@@ -1748,6 +1776,44 @@ mod tests {
     fn test_latest_jsonl_in_dir_empty_dir_returns_none() {
         let dir = TempDir::new().unwrap();
         assert_eq!(latest_jsonl_in_dir(dir.path()), None);
+    }
+
+    #[test]
+    fn test_latest_jsonl_in_dir_bails_out_past_scan_cap() {
+        // Proves the directory scan is capped, not proportional to
+        // historical session count: with more entries than
+        // V2_SESSION_DIR_SCAN_CAP present, mining must give up (None)
+        // rather than pay an unbounded read_dir + per-entry metadata()
+        // stat pass. A regression back to `.max_by_key()` over the full
+        // iterator would still return the newest file here instead of
+        // bailing out.
+        let dir = TempDir::new().unwrap();
+        for i in 0..(V2_SESSION_DIR_SCAN_CAP + 1) {
+            fs::write(dir.path().join(format!("session-{i}.jsonl")), "").unwrap();
+        }
+        assert_eq!(latest_jsonl_in_dir(dir.path()), None);
+    }
+
+    #[test]
+    fn test_latest_jsonl_in_dir_scans_normally_at_or_under_cap() {
+        // Preserves existing behavior for realistic (small/normal)
+        // directories: exactly at the cap, the newest file is still
+        // correctly identified rather than spuriously bailing out.
+        let dir = TempDir::new().unwrap();
+        for i in 0..V2_SESSION_DIR_SCAN_CAP {
+            let path = dir.path().join(format!("session-{i}.jsonl"));
+            fs::write(&path, "").unwrap();
+            // Force strictly increasing mtimes so the last-written file is
+            // unambiguously the newest one across filesystems with coarse
+            // mtime resolution.
+            let t = SystemTime::now() + std::time::Duration::from_secs(i as u64);
+            let ft = filetime::FileTime::from_system_time(t);
+            filetime::set_file_mtime(&path, ft).unwrap();
+        }
+        let newest = dir
+            .path()
+            .join(format!("session-{}.jsonl", V2_SESSION_DIR_SCAN_CAP - 1));
+        assert_eq!(latest_jsonl_in_dir(dir.path()), Some(newest));
     }
 
     #[test]
