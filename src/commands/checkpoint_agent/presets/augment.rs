@@ -1328,4 +1328,328 @@ mod tests {
             _ => panic!("Expected PreFileEdit"),
         }
     }
+
+    // ========================================================================
+    // Adversarial autodetection edge cases (CSS-2302 verification pass)
+    // ========================================================================
+
+    #[test]
+    fn test_augment_hook_event_name_null_routes_as_v2() {
+        // A `null` hook_event_name is not a string, so `has_v1_shape` must be
+        // false -- the payload should route as v2, not be treated as v1-shaped
+        // or ambiguous.
+        let input = json!({
+            "hook_event_name": null,
+            "hook_type": "PreToolUse",
+            "tool_name": "write",
+            "tool_input": {"path": "/tmp/proj/a.rs"},
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(_) => {}
+            _ => panic!("Expected PreFileEdit (v2 route)"),
+        }
+    }
+
+    #[test]
+    fn test_augment_hook_event_name_wrong_type_number_routes_as_v2() {
+        // A non-string hook_event_name (e.g. a stray number) must not count
+        // as v1 shape and must not trigger the ambiguous-shape error.
+        let input = json!({
+            "hook_event_name": 12345,
+            "hook_type": "PostToolUse",
+            "tool_name": "bash",
+            "tool_input": {"command": "ls"},
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostBashCall(_) => {}
+            _ => panic!("Expected PostBashCall (v2 route)"),
+        }
+    }
+
+    #[test]
+    fn test_augment_hook_type_wrong_type_object_routes_as_v1() {
+        // A non-string hook_type (e.g. a stray object) must not count as v2
+        // shape and must not trigger the ambiguous-shape error.
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "hook_type": {"nested": true},
+            "conversation_id": "conv-1",
+            "workspace_roots": ["/tmp/proj"],
+            "tool_name": "save-file",
+            "tool_input": {"path": "a.rs"},
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(_) => {}
+            _ => panic!("Expected PreFileEdit (v1 route)"),
+        }
+    }
+
+    // ========================================================================
+    // Adversarial v1 apply_patch coverage
+    // ========================================================================
+
+    #[test]
+    fn test_augment_apply_patch_multi_file_extracts_all_paths() {
+        // A single apply_patch call can add/update/delete several files in
+        // one patch; all target paths must be extracted (not just the
+        // first).
+        let patch = "\
+*** Begin Patch
+*** Add File: new.py
++print('new')
+*** Update File: existing.py
+@@
+-old
++new
+*** Delete File: gone.py
+*** End Patch";
+        let input = make_hook_input("PreToolUse", "apply_patch", json!({"input": patch}));
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(
+                    e.file_paths,
+                    vec![
+                        PathBuf::from("/Users/me/project/new.py"),
+                        PathBuf::from("/Users/me/project/existing.py"),
+                        PathBuf::from("/Users/me/project/gone.py"),
+                    ]
+                );
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_apply_patch_malformed_text_yields_empty_paths_not_error() {
+        // Patch text with none of the recognized `*** ... File:` markers
+        // must degrade to an empty file_paths list rather than erroring or
+        // panicking -- the tool is still a recognized file-edit tool, so we
+        // fail open on path *extraction* only, matching the pattern used by
+        // other apply_patch-style presets (Codex/Cursor/Droid).
+        let input = make_hook_input(
+            "PreToolUse",
+            "apply_patch",
+            json!({"input": "this is not a patch at all, just prose"}),
+        );
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert!(e.file_paths.is_empty());
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_extract_file_paths_precedence_file_paths_array_wins() {
+        // If a tool_input ever carries both `file_paths` (array) and `path`
+        // (scalar) -- not observed live, but defensively specified -- the
+        // array must take precedence, matching the checked order in
+        // extract_augment_file_paths.
+        let input = make_hook_input(
+            "PostToolUse",
+            "remove-files",
+            json!({"file_paths": ["a.rs", "b.rs"], "path": "c.rs"}),
+        );
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => {
+                assert_eq!(
+                    e.file_paths,
+                    vec![
+                        PathBuf::from("/Users/me/project/a.rs"),
+                        PathBuf::from("/Users/me/project/b.rs"),
+                    ]
+                );
+            }
+            _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_post_file_changes_empty_array_falls_back_to_tool_input() {
+        // An empty (but present) file_changes[] array must not win over a
+        // usable tool_input.path -- extract_post_file_paths returns empty,
+        // and the caller must fall back to extract_augment_file_paths.
+        let input = json!({
+            "hook_event_name": "PostToolUse",
+            "conversation_id": "conv-1",
+            "workspace_roots": ["/Users/me/project"],
+            "tool_name": "save-file",
+            "tool_input": {"path": "src/fallback.rs"},
+            "file_changes": [],
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => {
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from("/Users/me/project/src/fallback.rs")]
+                );
+            }
+            _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    // ========================================================================
+    // Adversarial v2 coverage
+    // ========================================================================
+
+    #[test]
+    fn test_augment_v2_missing_tool_input_path_yields_empty_file_paths_not_error() {
+        // A malformed/partial v2 write payload missing tool_input.path must
+        // not error -- it degrades to an empty file_paths list, consistent
+        // with the shared file_paths_from_tool_input contract used by other
+        // presets (e.g. claude.rs).
+        let input = json!({
+            "hook_type": "PreToolUse",
+            "tool_name": "write",
+            "tool_input": {"content": "no path field here"},
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert!(e.file_paths.is_empty());
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_v2_absolute_path_passes_through_unchanged() {
+        // v2's workspace root is env::current_dir(); an already-absolute
+        // tool_input.path must not be re-rooted under it.
+        let input = r#"{"hook_type":"PreToolUse","tool_name":"write","tool_input":{"path":"/etc/hosts","content":""}}"#;
+        let events = AugmentPreset.parse(input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.file_paths, vec![PathBuf::from("/etc/hosts")]);
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_v2_unknown_tool_name_pretooluse_errors_not_skipped_silently() {
+        // A v2 tool name outside the known write/edit/bash/read set must
+        // fail closed (PresetError), same as v1's unsupported-tool policy --
+        // never silently fabricate or silently drop the event.
+        let input = r#"{"hook_type":"PreToolUse","tool_name":"totally-unknown-tool","tool_input":{"path":"x"}}"#;
+        let result = AugmentPreset.parse(input, "t_test");
+        assert!(result.is_err());
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(
+                    msg.contains("PreToolUse for unsupported tool"),
+                    "got: {}",
+                    msg
+                );
+            }
+            _ => panic!("Expected PresetError"),
+        }
+    }
+
+    // ========================================================================
+    // Adversarial v2 session-file mining coverage
+    // ========================================================================
+
+    #[test]
+    fn test_latest_jsonl_in_dir_empty_dir_returns_none() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(latest_jsonl_in_dir(dir.path()), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_mine_v2_session_info_corrupt_first_line_still_mines_model_from_tail() {
+        // A corrupt/non-JSON header line must not abort mining entirely --
+        // session_id degrades to None (mirroring the outer caller's
+        // stable-hash fallback), but the model can still be recovered from
+        // the tail scan.
+        let cache_dir = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let workspace_path = workspace.path().canonicalize().unwrap();
+        let slug = v2_workspace_slug(&workspace_path.to_string_lossy());
+        let session_dir = cache_dir
+            .path()
+            .join(".augment")
+            .join("sessions-v2")
+            .join(format!("--{}--", slug));
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_file = session_dir.join("corrupt-session.jsonl");
+        fs::write(
+            &session_file,
+            "not even json\n{\"type\":\"model_change\",\"modelId\":\"recovered-model\"}\n",
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
+        }
+        let mined = mine_v2_session_info(&workspace_path);
+        unsafe {
+            std::env::remove_var("AUGMENT_CACHE_DIR");
+        }
+
+        assert_eq!(mined.session_id, None);
+        assert_eq!(mined.model, Some("recovered-model".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_mine_v2_session_info_respects_tail_bound_ignores_head_only_model() {
+        // Proves the tail bound is real (not an accidental full-file read):
+        // a model_change entry placed only in the file's head, followed by
+        // enough padding to push it beyond V2_SESSION_TAIL_BYTES from the
+        // end, must NOT be found -- if the implementation regressed to a
+        // full-file scan, this would incorrectly return the head model.
+        let cache_dir = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let workspace_path = workspace.path().canonicalize().unwrap();
+        let slug = v2_workspace_slug(&workspace_path.to_string_lossy());
+        let session_dir = cache_dir
+            .path()
+            .join(".augment")
+            .join("sessions-v2")
+            .join(format!("--{}--", slug));
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_file = session_dir.join("oversized-session.jsonl");
+
+        let mut content = String::new();
+        content.push_str("{\"type\":\"session\",\"id\":\"big-session\"}\n");
+        content.push_str("{\"type\":\"model_change\",\"modelId\":\"should-be-invisible\"}\n");
+        // Pad well past the tail bound with lines carrying no model info,
+        // so the only model_change entry ends up strictly in the head.
+        let filler_line = format!(
+            "{{\"type\":\"message\",\"text\":\"{}\"}}\n",
+            "x".repeat(200)
+        );
+        let filler_bytes_needed = (V2_SESSION_TAIL_BYTES as usize) + 8192;
+        while content.len() < filler_bytes_needed {
+            content.push_str(&filler_line);
+        }
+        fs::write(&session_file, &content).unwrap();
+
+        unsafe {
+            std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
+        }
+        let mined = mine_v2_session_info(&workspace_path);
+        unsafe {
+            std::env::remove_var("AUGMENT_CACHE_DIR");
+        }
+
+        // Header id is still readable (only the first line is read for it).
+        assert_eq!(mined.session_id, Some("big-session".to_string()));
+        // The head-only model_change fell outside the tail window.
+        assert_eq!(mined.model, None);
+    }
 }
