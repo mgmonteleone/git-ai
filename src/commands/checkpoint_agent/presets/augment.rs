@@ -39,7 +39,7 @@
 //! Transcript reading: not implemented. Augment exposes
 //! `conversation.agentCodeResponse[]` only on `Stop` when
 //! `metadata.includeConversationData` is enabled, but no on-disk
-//! transcript file is documented. `transcript_source` is therefore set
+//! transcript file is documented. `stream_source` is therefore set
 //! to `None`. Hook-based attribution still works without it; a
 //! dedicated reader can land in a follow-up PR.
 
@@ -149,6 +149,7 @@ impl AgentPreset for AugmentPreset {
                     ParsedHookEvent::PreBashCall(PreBashCall {
                         context,
                         tool_use_id: "bash".to_string(),
+                        command: parse::bash_command_from_hook_input(&data),
                     })
                 } else if is_file_edit {
                     ParsedHookEvent::PreFileEdit(PreFileEdit {
@@ -169,11 +170,12 @@ impl AgentPreset for AugmentPreset {
                     ParsedHookEvent::PostBashCall(PostBashCall {
                         context,
                         tool_use_id: "bash".to_string(),
+                        command: parse::bash_command_from_hook_input(&data),
                         // Transcript reader for Augment's conversation
                         // history is not yet implemented; setting None
                         // avoids feeding an unsupported format to the
                         // existing readers.
-                        transcript_source: None,
+                        stream_source: None,
                     })
                 } else if is_file_edit {
                     // Prefer file_changes[].path on PostToolUse (present
@@ -190,7 +192,7 @@ impl AgentPreset for AugmentPreset {
                         context,
                         file_paths,
                         dirty_files: None,
-                        transcript_source: None,
+                        stream_source: None,
                         tool_use_id: None,
                     })
                 } else {
@@ -290,7 +292,7 @@ mod tests {
                     vec![PathBuf::from("/Users/me/project/src/lib.rs")]
                 );
                 assert!(
-                    e.transcript_source.is_none(),
+                    e.stream_source.is_none(),
                     "Transcript reader not yet implemented; should be None"
                 );
             }
@@ -364,6 +366,7 @@ mod tests {
             ParsedHookEvent::PreBashCall(e) => {
                 assert_eq!(e.context.agent_id.tool, "augment");
                 assert_eq!(e.tool_use_id, "bash");
+                assert_eq!(e.command.as_deref(), Some("git status"));
             }
             _ => panic!("Expected PreBashCall"),
         }
@@ -376,7 +379,8 @@ mod tests {
         match &events[0] {
             ParsedHookEvent::PostBashCall(e) => {
                 assert_eq!(e.context.agent_id.tool, "augment");
-                assert!(e.transcript_source.is_none());
+                assert_eq!(e.command.as_deref(), Some("ls"));
+                assert!(e.stream_source.is_none());
             }
             _ => panic!("Expected PostBashCall"),
         }

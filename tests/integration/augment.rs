@@ -52,8 +52,8 @@ fn test_augment_routes_save_file_to_post_file_edit() {
             assert_eq!(e.context.agent_id.id, "conv-1");
             assert_eq!(e.context.agent_id.model, "unknown");
             assert!(
-                e.transcript_source.is_none(),
-                "transcript_source should be None until an Augment reader lands"
+                e.stream_source.is_none(),
+                "stream_source should be None until an Augment reader lands"
             );
         }
         _ => panic!("Expected PostFileEdit"),
@@ -145,7 +145,7 @@ fn test_augment_routes_launch_process_to_bash() {
     match &events[0] {
         ParsedHookEvent::PostBashCall(e) => {
             assert_eq!(e.context.agent_id.tool, "augment");
-            assert!(e.transcript_source.is_none());
+            assert!(e.stream_source.is_none());
         }
         _ => panic!("Expected PostBashCall"),
     }
