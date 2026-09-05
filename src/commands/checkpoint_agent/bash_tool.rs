@@ -372,7 +372,9 @@ pub fn classify_tool(agent: Agent, tool_name: &str) -> ToolClass {
             _ => ToolClass::Skip,
         },
         Agent::Augment => match tool_name {
-            "save-file" | "str-replace-editor" | "remove-files" => ToolClass::FileEdit,
+            "save-file" | "str-replace-editor" | "remove-files" | "apply_patch" => {
+                ToolClass::FileEdit
+            }
             "launch-process" => ToolClass::Bash,
             _ => ToolClass::Skip,
         },
@@ -1571,6 +1573,10 @@ mod tests {
         );
         assert_eq!(
             classify_tool(Agent::Augment, "remove-files"),
+            ToolClass::FileEdit
+        );
+        assert_eq!(
+            classify_tool(Agent::Augment, "apply_patch"),
             ToolClass::FileEdit
         );
         assert_eq!(

@@ -18,6 +18,10 @@
 //! Tool naming differs from Claude (kebab-case lowercase):
 //!   - `save-file` / `str-replace-editor` → file edit (field: `tool_input.path`)
 //!   - `remove-files` → file edit (field: `tool_input.file_paths`, plural array)
+//!   - `apply_patch` → file edit (field: `tool_input.input`, a patch-format
+//!     string with `*** Add/Update/Delete File: <path>` markers; observed
+//!     live against auggie CLI 0.36.0, which uses this tool for whole-file
+//!     creates instead of `save-file`)
 //!   - `launch-process` → bash (field: `tool_input.command`)
 //!
 //! Notably **absent** from the payload (verified against the public docs):
@@ -80,6 +84,20 @@ fn extract_augment_file_paths(data: &serde_json::Value, workspace_root: &str) ->
         && !path.is_empty()
     {
         return vec![parse::resolve_absolute(path, workspace_root)];
+    }
+
+    // `apply_patch` sends the whole patch as `input`; the file path(s) are
+    // embedded in `*** Add/Update/Delete File: <path>` marker lines.
+    if let Some(patch) = tool_input.get("input").and_then(|v| v.as_str()) {
+        let mut raw_paths: Vec<String> = Vec::new();
+        parse::collect_apply_patch_paths_from_text(patch, &mut raw_paths);
+        let paths: Vec<PathBuf> = raw_paths
+            .iter()
+            .map(|p| parse::resolve_absolute(p, workspace_root))
+            .collect();
+        if !paths.is_empty() {
+            return paths;
+        }
     }
 
     vec![]
@@ -348,6 +366,56 @@ mod tests {
                         PathBuf::from("/Users/me/project/src/dead.rs"),
                         PathBuf::from("/Users/me/project/src/old.rs"),
                     ]
+                );
+            }
+            _ => panic!("Expected PostFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_apply_patch_pre_tool_use_extracts_path_from_patch_text() {
+        // Observed live against auggie CLI 0.36.0: `apply_patch` sends the
+        // whole patch as `tool_input.input`, with no `path`/`file_paths`
+        // field. PreToolUse must still resolve the target file so it can be
+        // checkpointed before the edit lands.
+        let input = make_hook_input(
+            "PreToolUse",
+            "apply_patch",
+            json!({"input": "*** Begin Patch\n*** Add File: hello.py\n+def greet(name):\n+    return f'Hello, {name}!'\n*** End Patch"}),
+        );
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from("/Users/me/project/hello.py")]
+                );
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    fn test_augment_apply_patch_post_tool_use_prefers_file_changes() {
+        // PostToolUse carries `file_changes[].path` (authoritative) in
+        // addition to the raw patch text; file_changes must win.
+        let input = json!({
+            "hook_event_name": "PostToolUse",
+            "conversation_id": "conv-xyz789",
+            "workspace_roots": ["/Users/me/project"],
+            "tool_name": "apply_patch",
+            "tool_input": {"input": "*** Begin Patch\n*** Add File: greet2.py\n+def add(a, b):\n+    return a + b\n*** End Patch"},
+            "file_changes": [
+                {"path": "greet2.py", "changeType": "create"},
+            ],
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
+        match &events[0] {
+            ParsedHookEvent::PostFileEdit(e) => {
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from("/Users/me/project/greet2.py")]
                 );
             }
             _ => panic!("Expected PostFileEdit"),
