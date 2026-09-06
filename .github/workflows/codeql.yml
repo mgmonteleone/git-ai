@@ -19,6 +19,15 @@ on:
   schedule:
     - cron: '23 7 * * 4'
 
+# Cancel a superseded run only when a newer push lands on the SAME pull
+# request. Non-PR triggers (push/main, schedule) get a group unique to that
+# execution (run id + attempt) so they are never serialized or canceled
+# against each other; the workflow name keeps this isolated from other
+# workflows' concurrency groups.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
