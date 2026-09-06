@@ -413,8 +413,8 @@ fn test_augment_v2_routes_write_to_post_file_edit() {
             );
             assert!(
                 e.file_paths[0].ends_with("main.rs"),
-                "expected main.rs, got {:?}",
-                e.file_paths
+                "expected main.rs, got {}",
+                e.file_paths[0].display()
             );
         }
         _ => panic!("Expected PostFileEdit"),
