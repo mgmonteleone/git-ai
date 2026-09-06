@@ -94,26 +94,27 @@
 //!   - **Workspace root**: v2's hook subprocess inherits the already
 //!     `chdir`'d CLI process cwd, so `std::env::current_dir()` recovers it
 //!     for free (confirmed live) — simpler than v1's JSON field read.
-//!   - **Session id / model (MVP tier)**: best-effort mining of the
-//!     on-disk `~/.augment/sessions-v2/--<cwd-slug>--/*.jsonl` session
-//!     file (header `id` for the session id, tail-scanned
-//!     `model_change`/message `model` for the live model), but ONLY when
-//!     exactly one `*.jsonl` file exists for the workspace. The v2 hook
-//!     payload carries no session identifier (see above), so if more
-//!     than one session file is present — e.g. two concurrently active
-//!     `auggie-v2` sessions in the same workspace, or leftover history —
-//!     there is no way to tell which file belongs to the *current*
-//!     invocation. Picking the newest-mtime file in that case would risk
-//!     silently attributing this hook to a DIFFERENT, concurrently
-//!     active session (wrong `external_session_id` and model), so mining
-//!     fails closed instead of guessing whenever the candidate file is
-//!     ambiguous. This is undocumented internal file format, not a
-//!     contract — mining is strictly best-effort, bounded (sole file
-//!     only, tail-only read, never an unbounded scan), and NEVER blocks
-//!     or slows the parse path: any failure or ambiguity degrades to a
-//!     stable `generate_session_id(cwd, "augment")` hash and
-//!     `model: "unknown"`, mirroring the v1 preset's own
-//!     missing-metadata fallback.
+//!   - **Session id / model**: NOT recovered from disk. The v2 hook
+//!     payload carries no field that reliably links a hook invocation to
+//!     any specific on-disk session file. An earlier revision
+//!     best-effort-mined `~/.augment/sessions-v2/--<cwd-slug>--/*.jsonl`
+//!     (header `id` / tail-scanned `model_change`/message `model`), first
+//!     picking the newest-mtime file, then narrowing to "only when
+//!     exactly one file exists" (CSS-2302 review discussion_r3942067002).
+//!     Both were guesses: even a *sole* file in that directory is not
+//!     provably the current session — it can be a leftover from a prior,
+//!     unrelated invocation that simply never got cleaned up, or another
+//!     session's file if this is the first hook of a brand new session
+//!     before its own file exists. There is no real-payload evidence that
+//!     can turn "a file happens to be there" into "this file is *this*
+//!     hook's session", so the mining was removed entirely rather than
+//!     replaced with a different heuristic. Session id is therefore
+//!     always the stable `generate_session_id(cwd, "augment")` hash and
+//!     model is always `"unknown"` — the same safe fallback the v1 preset
+//!     uses for its own missing-metadata case, applied unconditionally
+//!     for v2. This trades away best-effort real id/model recovery for
+//!     the guarantee that a v2 checkpoint can never be attributed to the
+//!     wrong session.
 //!   - **Tool classification**: v2's default toolset names happen to
 //!     coincide with Claude's (`write`/`edit`/`bash`) — added directly to
 //!     the existing `Agent::Augment` arm in `classify_tool` (no v1/v2
@@ -135,9 +136,7 @@ use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 use crate::error::GitAiError;
 use std::collections::HashMap;
-use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub struct AugmentPreset;
 
@@ -430,14 +429,13 @@ fn parse_v2(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
     let is_bash = tool_class == ToolClass::Bash;
     let is_file_edit = tool_class == ToolClass::FileEdit;
 
-    // MVP session id / model: best-effort session-file mining with a
-    // graceful, immediate degrade to a stable cwd-derived hash + "unknown"
-    // model on any miss. Mining never blocks or slows the parse path.
-    let mined = mine_v2_session_info(&workspace_root_path);
-    let session_id = mined
-        .session_id
-        .unwrap_or_else(|| generate_session_id(&workspace_root, "augment"));
-    let model = mined.model.unwrap_or_else(|| "unknown".to_string());
+    // Session id / model: no on-disk mining (see module docs, CSS-2302
+    // round 2 / discussion_r3942067002) -- the v2 hook payload has no
+    // field that reliably links this invocation to a specific session
+    // file, so always use the stable cwd-derived hash and "unknown",
+    // mirroring the v1 preset's own missing-metadata fallback.
+    let session_id = generate_session_id(&workspace_root, "augment");
+    let model = "unknown".to_string();
 
     let context = PresetContext {
         agent_id: AgentId {
@@ -522,189 +520,13 @@ fn parse_v2(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
     Ok(vec![event])
 }
 
-/// Best-effort result of mining the on-disk v2 session file. Either field
-/// may be `None` on any miss (dir/file not found, unreadable, malformed,
-/// etc.) — callers must degrade gracefully, never propagate an error.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct MinedV2SessionInfo {
-    session_id: Option<String>,
-    model: Option<String>,
-}
-
-/// Bound on how much of a session file's tail we'll read to look for the
-/// most recent model info. Keeps the cost O(1) regardless of session
-/// length — never an unbounded scan.
-const V2_SESSION_TAIL_BYTES: u64 = 65536;
-
-/// Slugifies a workspace root the same way cosmos-agent's session manager
-/// does for its `sessions-v2/--<slug>--/` directory naming: strip the
-/// leading path separator, then replace remaining separators with `-`.
-/// Confirmed live against this VM's own `~/.augment/sessions-v2/` layout
-/// (see `V2FeasibilityAssessment`). Undocumented internal format, MVP-only.
-fn v2_workspace_slug(cwd: &str) -> String {
-    cwd.trim_start_matches(['/', '\\'])
-        .replace(['/', '\\'], "-")
-}
-
-/// Root directory v2 stores its agent state under, respecting the
-/// `AUGMENT_CACHE_DIR` env var override (the only override visible to a
-/// hook subprocess — a CLI-flag-only override is not, per the feasibility
-/// assessment). Falls back to `~/.augment`.
-fn v2_agent_dir() -> PathBuf {
-    std::env::var("AUGMENT_CACHE_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate::mdm::utils::home_dir().join(".augment"))
-}
-
-/// Hard cap on directory entries `sole_jsonl_in_dir` will examine per
-/// call. A workspace's `sessions-v2/--<slug>--/` directory accumulates one
-/// file per historical session and is never pruned, so an unbounded
-/// `read_dir` pass would make cost grow with a workspace's entire session
-/// history instead of staying O(1) per hook invocation. 512 comfortably
-/// covers realistic day-to-day session counts for a single workspace
-/// while still bounding worst-case work to a few hundred directory
-/// entries; if a directory has more entries than this, mining bails out
-/// (see below) rather than scan it — we cannot otherwise be sure no
-/// second `*.jsonl` file exists further down the (unordered) listing.
-const V2_SESSION_DIR_SCAN_CAP: usize = 512;
-
-/// Returns the sole `*.jsonl` file directly inside `dir`, or `None` if
-/// the directory is missing/empty/unreadable, holds more than
-/// `V2_SESSION_DIR_SCAN_CAP` entries, or contains more than one `*.jsonl`
-/// file. Single, non-recursive directory listing, bounded to constant
-/// work regardless of how many historical session files have accumulated
-/// for a workspace.
-///
-/// Deliberately does NOT fall back to "pick the newest by mtime" when
-/// more than one candidate exists: the v2 hook payload carries no session
-/// identifier, so with two-or-more session files present (e.g. a second,
-/// concurrently active `auggie-v2` session in the same workspace) there
-/// is no defensible way to tell which one belongs to the *current*
-/// invocation. Picking by mtime risks silently attributing this hook to
-/// a DIFFERENT session's `external_session_id`/model. Callers already
-/// degrade gracefully on `None` (regenerated session id + "unknown"
-/// model), so failing closed on ambiguity (or on a too-large directory,
-/// where uniqueness can't be confirmed within the scan cap) is the safe
-/// choice.
-fn sole_jsonl_in_dir(dir: &Path) -> Option<PathBuf> {
-    let entries = fs::read_dir(dir).ok()?;
-    let mut found: Option<PathBuf> = None;
-    for (count, entry) in entries.enumerate() {
-        if count >= V2_SESSION_DIR_SCAN_CAP {
-            // Directory has more entries than we're willing to scan;
-            // bail out rather than let cost scale with session history.
-            return None;
-        }
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-            continue;
-        }
-        if found.is_some() {
-            // A second candidate makes the choice ambiguous -- refuse to
-            // guess which session file belongs to this invocation.
-            return None;
-        }
-        found = Some(path);
-    }
-    found
-}
-
-/// Reads at most the last `max_bytes` of `path`, lossily decoded as UTF-8.
-/// Returns `(tail, truncated)` where `truncated` indicates the read did
-/// not start at byte 0 (so the first returned line may be a partial line
-/// and should be discarded by the caller).
-fn read_tail(path: &Path, max_bytes: u64) -> Option<(String, bool)> {
-    let mut file = fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let start = len.saturating_sub(max_bytes);
-    file.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    Some((String::from_utf8_lossy(&buf).into_owned(), start > 0))
-}
-
-/// Scans a tail-read chunk backwards (most-recent-first) for the live
-/// model name, matching either a `model_change` event's `modelId` or a
-/// `message` entry's `model` field.
-fn extract_model_from_tail(tail: &str, truncated: bool) -> Option<String> {
-    let mut lines: Vec<&str> = tail.lines().collect();
-    if truncated && !lines.is_empty() {
-        // The first line of a tail-seeked read may be a partial line cut
-        // mid-JSON; drop it rather than risk a misleading parse.
-        lines.remove(0);
-    }
-
-    for line in lines.iter().rev() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let entry_type = value.get("type").and_then(|t| t.as_str());
-        if entry_type == Some("model_change")
-            && let Some(model_id) = value.get("modelId").and_then(|m| m.as_str())
-            && !model_id.is_empty()
-        {
-            return Some(model_id.to_string());
-        }
-        if entry_type == Some("message")
-            && let Some(model) = value.get("model").and_then(|m| m.as_str())
-            && !model.is_empty()
-        {
-            return Some(model.to_string());
-        }
-    }
-    None
-}
-
-/// Best-effort mining of `~/.augment/sessions-v2/--<cwd-slug>--/` for the
-/// current workspace's session id and live model name. Never fails loudly:
-/// any I/O error, missing directory, unreadable/ambiguous session file, or
-/// malformed content simply yields `None` for the affected field. See the
-/// module docs for the full rationale and the MVP-vs-full-parity tradeoff.
-fn mine_v2_session_info(workspace_root: &Path) -> MinedV2SessionInfo {
-    let cwd_str = workspace_root.to_string_lossy();
-    let session_dir = v2_agent_dir()
-        .join("sessions-v2")
-        .join(format!("--{}--", v2_workspace_slug(&cwd_str)));
-
-    // Only mine when exactly one session file exists for this workspace --
-    // with two or more candidates (e.g. a concurrently active second
-    // session) there is no way to tell which one this hook belongs to, so
-    // fail closed to the caller's safe fallback rather than guess.
-    let Some(session_file) = sole_jsonl_in_dir(&session_dir) else {
-        return MinedV2SessionInfo::default();
-    };
-
-    // Bounded: read only the first line for the session header's `id`.
-    let session_id = fs::File::open(&session_file).ok().and_then(|f| {
-        let mut lines = BufReader::new(f).lines();
-        let first_line = lines.next()?.ok()?;
-        let value: serde_json::Value = serde_json::from_str(&first_line).ok()?;
-        if value.get("type").and_then(|t| t.as_str()) != Some("session") {
-            return None;
-        }
-        value
-            .get("id")
-            .and_then(|id| id.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    });
-
-    // Bounded: read only the tail for the most recent model info.
-    let model = read_tail(&session_file, V2_SESSION_TAIL_BYTES)
-        .and_then(|(tail, truncated)| extract_model_from_tail(&tail, truncated));
-
-    MinedV2SessionInfo { session_id, model }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::checkpoint_agent::presets::*;
     use serde_json::json;
     use serial_test::serial;
+    use std::fs;
     use tempfile::TempDir;
 
     fn make_hook_input(event: &str, tool: &str, tool_input: serde_json::Value) -> String {
@@ -1288,163 +1110,14 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ------------------------------------------------------------------
-    // v2 session-file mining (best-effort, bounded)
-    // ------------------------------------------------------------------
-
     #[test]
-    fn test_v2_workspace_slug_strips_leading_slash_and_replaces_separators() {
-        assert_eq!(
-            v2_workspace_slug("/tmp/hooktest/workspace"),
-            "tmp-hooktest-workspace"
-        );
-        assert_eq!(v2_workspace_slug("/workspace"), "workspace");
-    }
-
-    #[test]
-    fn test_extract_model_from_tail_prefers_most_recent_model_change() {
-        let tail = "{\"type\":\"model_change\",\"modelId\":\"model-a\"}\n{\"type\":\"model_change\",\"modelId\":\"model-b\"}\n";
-        assert_eq!(
-            extract_model_from_tail(tail, false),
-            Some("model-b".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_model_from_tail_falls_back_to_message_model() {
-        let tail = "{\"type\":\"message\",\"model\":\"prism_tenant_custom\"}\n";
-        assert_eq!(
-            extract_model_from_tail(tail, false),
-            Some("prism_tenant_custom".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_model_from_tail_discards_truncated_first_line() {
-        // Simulate a tail-seek landing mid-line: the first "line" is a
-        // partial fragment that must not be parsed as JSON.
-        let tail =
-            "\"modelId\":\"garbage\"}\n{\"type\":\"model_change\",\"modelId\":\"model-c\"}\n";
-        assert_eq!(
-            extract_model_from_tail(tail, true),
-            Some("model-c".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_model_from_tail_returns_none_when_absent() {
-        let tail = "{\"type\":\"session\",\"id\":\"abc\"}\n";
-        assert_eq!(extract_model_from_tail(tail, false), None);
-    }
-
-    #[test]
-    fn test_mine_v2_session_info_missing_dir_returns_defaults() {
-        let mined = mine_v2_session_info(Path::new("/nonexistent/workspace/for/this/test"));
-        assert_eq!(mined, MinedV2SessionInfo::default());
-    }
-
-    #[test]
-    #[serial]
-    fn test_mine_v2_session_info_reads_header_id_and_tail_model() {
-        let cache_dir = TempDir::new().unwrap();
-        let workspace = TempDir::new().unwrap();
-        let workspace_path = workspace.path().canonicalize().unwrap();
-        let slug = v2_workspace_slug(&workspace_path.to_string_lossy());
-        let session_dir = cache_dir
-            .path()
-            .join(".augment")
-            .join("sessions-v2")
-            .join(format!("--{}--", slug));
-        fs::create_dir_all(&session_dir).unwrap();
-        let session_file = session_dir.join("4f2ba0-session.jsonl");
-        fs::write(
-            &session_file,
-            format!(
-                "{{\"type\":\"session\",\"id\":\"real-session-id-123\",\"cwd\":\"{}\"}}\n{{\"type\":\"model_change\",\"provider\":\"anthropic\",\"modelId\":\"prism_tenant_custom\"}}\n",
-                workspace_path.to_string_lossy()
-            ),
-        )
-        .unwrap();
-
-        unsafe {
-            std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
-        }
-        let mined = mine_v2_session_info(&workspace_path);
-        unsafe {
-            std::env::remove_var("AUGMENT_CACHE_DIR");
-        }
-
-        assert_eq!(mined.session_id, Some("real-session-id-123".to_string()));
-        assert_eq!(mined.model, Some("prism_tenant_custom".to_string()));
-    }
-
-    #[test]
-    #[serial]
-    fn test_mine_v2_session_info_refuses_to_guess_between_competing_same_workspace_sessions() {
-        // Regression for discussion_r3942067002: two session files in the
-        // same workspace directory simulate a second, concurrently active
-        // `auggie-v2` session (or stale leftover history) alongside the
-        // "current" one. The v2 hook payload carries no session
-        // identifier, so there is no defensible way to know which file
-        // belongs to *this* invocation. Picking by newest mtime (the old,
-        // pre-fix behavior) would silently attribute this hook to
-        // whichever session happened to write most recently -- merging
-        // unrelated checkpoints under the wrong `external_session_id`/
-        // model. The fix must fail closed to the safe MVP fallback
-        // (`None`/`None`, i.e. regenerated id + "unknown" model) instead.
-        let cache_dir = TempDir::new().unwrap();
-        let workspace = TempDir::new().unwrap();
-        let workspace_path = workspace.path().canonicalize().unwrap();
-        let slug = v2_workspace_slug(&workspace_path.to_string_lossy());
-        let session_dir = cache_dir
-            .path()
-            .join(".augment")
-            .join("sessions-v2")
-            .join(format!("--{}--", slug));
-        fs::create_dir_all(&session_dir).unwrap();
-
-        // "other" is the concurrently active session that happens to have
-        // the newest mtime -- the exact case that used to win under the
-        // old newest-mtime selection.
-        let mine = session_dir.join("mine.jsonl");
-        fs::write(
-            &mine,
-            "{\"type\":\"session\",\"id\":\"my-real-session-id\"}\n",
-        )
-        .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let other = session_dir.join("other.jsonl");
-        fs::write(
-            &other,
-            "{\"type\":\"session\",\"id\":\"someone-elses-session-id\"}\n",
-        )
-        .unwrap();
-
-        unsafe {
-            std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
-        }
-        let mined = mine_v2_session_info(&workspace_path);
-        unsafe {
-            std::env::remove_var("AUGMENT_CACHE_DIR");
-        }
-
-        // Must NOT pick either session's id/model -- ambiguous means
-        // "unknown", never a guess.
-        assert_eq!(mined, MinedV2SessionInfo::default());
-    }
-
-    #[test]
-    #[serial]
-    fn test_augment_v2_falls_back_to_stable_session_id_when_mining_fails() {
-        let cache_dir = TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
-        }
+    fn test_augment_v2_always_uses_generated_session_id_and_unknown_model() {
+        // No session-file mining occurs at all (CSS-2302 round 2,
+        // discussion_r3942067002): session id/model are always the
+        // stable cwd-derived hash + "unknown", regardless of the
+        // filesystem state.
         let input = r#"{"hook_type":"PreToolUse","tool_name":"write","tool_input":{"path":"/tmp/proj/x.txt"}}"#;
         let events = AugmentPreset.parse(input, "t_test").unwrap();
-        unsafe {
-            std::env::remove_var("AUGMENT_CACHE_DIR");
-        }
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let expected_id = generate_session_id(&cwd.to_string_lossy(), "augment");
@@ -1452,6 +1125,58 @@ mod tests {
             ParsedHookEvent::PreFileEdit(e) => {
                 assert_eq!(e.context.agent_id.id, expected_id);
                 assert_eq!(e.context.agent_id.model, "unknown");
+            }
+            _ => panic!("Expected PreFileEdit"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_augment_v2_ignores_any_on_disk_session_file_never_reads_session_history() {
+        // Round-2 follow-up regression for discussion_r3942067002: round
+        // 1's fix ("mine only when the file is the SOLE candidate") was
+        // insufficient -- uniqueness does not prove linkage. A single
+        // leftover/historical/unrelated session file sitting exactly
+        // where the old mining logic used to look must never influence
+        // the result. Production code no longer looks at
+        // AUGMENT_CACHE_DIR or any sessions-v2 directory at all; this
+        // test reproduces the legacy directory-naming convention
+        // in-line purely as a fixture (the removed mining code used to
+        // require the file be there -- we prove it no longer matters).
+        let cache_dir = TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd_str = cwd.to_string_lossy();
+        let slug = cwd_str
+            .trim_start_matches(['/', '\\'])
+            .replace(['/', '\\'], "-");
+        let session_dir = cache_dir
+            .path()
+            .join(".augment")
+            .join("sessions-v2")
+            .join(format!("--{}--", slug));
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("lone-historical-session.jsonl"),
+            "{\"type\":\"session\",\"id\":\"someone-elses-real-session-id\"}\n{\"type\":\"model_change\",\"modelId\":\"someone-elses-model\"}\n",
+        )
+        .unwrap();
+
+        let input = r#"{"hook_type":"PreToolUse","tool_name":"write","tool_input":{"path":"/tmp/proj/x.txt"}}"#;
+        let events = AugmentPreset.parse(input, "t_test").unwrap();
+        unsafe {
+            std::env::remove_var("AUGMENT_CACHE_DIR");
+        }
+
+        let expected_id = generate_session_id(&cwd_str, "augment");
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.id, expected_id);
+                assert_eq!(e.context.agent_id.model, "unknown");
+                assert_ne!(e.context.agent_id.id, "someone-elses-real-session-id");
+                assert_ne!(e.context.agent_id.model, "someone-elses-model");
             }
             _ => panic!("Expected PreFileEdit"),
         }
@@ -1810,153 +1535,5 @@ mod tests {
             }
             _ => panic!("Expected PresetError"),
         }
-    }
-
-    // ========================================================================
-    // Adversarial v2 session-file mining coverage
-    // ========================================================================
-
-    #[test]
-    fn test_sole_jsonl_in_dir_empty_dir_returns_none() {
-        let dir = TempDir::new().unwrap();
-        assert_eq!(sole_jsonl_in_dir(dir.path()), None);
-    }
-
-    #[test]
-    fn test_sole_jsonl_in_dir_single_file_returns_it() {
-        let dir = TempDir::new().unwrap();
-        let only = dir.path().join("session.jsonl");
-        fs::write(&only, "").unwrap();
-        assert_eq!(sole_jsonl_in_dir(dir.path()), Some(only));
-    }
-
-    #[test]
-    fn test_sole_jsonl_in_dir_multiple_files_returns_none() {
-        // Regression for discussion_r3942067002: more than one `*.jsonl`
-        // candidate (e.g. a second, concurrently active session in the
-        // same workspace) is ambiguous -- the v2 hook payload carries no
-        // session identifier to disambiguate them, so mining must refuse
-        // to guess (never fall back to "pick the newest by mtime").
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("a.jsonl"), "").unwrap();
-        fs::write(dir.path().join("b.jsonl"), "").unwrap();
-        assert_eq!(sole_jsonl_in_dir(dir.path()), None);
-    }
-
-    #[test]
-    fn test_sole_jsonl_in_dir_bails_out_past_scan_cap() {
-        // Proves the directory scan is capped, not proportional to
-        // historical session count: with more entries than
-        // V2_SESSION_DIR_SCAN_CAP present, mining must give up (None)
-        // rather than pay an unbounded read_dir pass, even when there is
-        // only one genuine `*.jsonl` candidate among the entries -- past
-        // the cap we can no longer be sure a second candidate isn't
-        // lurking further down the (unordered) listing, so we bail rather
-        // than risk silently trusting a false "sole file" result.
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("session.jsonl"), "").unwrap();
-        for i in 0..V2_SESSION_DIR_SCAN_CAP {
-            fs::write(dir.path().join(format!("other-{i}.txt")), "").unwrap();
-        }
-        assert_eq!(sole_jsonl_in_dir(dir.path()), None);
-    }
-
-    #[test]
-    fn test_sole_jsonl_in_dir_scans_normally_at_or_under_cap() {
-        // Preserves existing behavior for realistic (small/normal)
-        // directories: at or under the cap, the sole `*.jsonl` file is
-        // still correctly identified rather than spuriously bailing out.
-        let dir = TempDir::new().unwrap();
-        let target = dir.path().join("session.jsonl");
-        fs::write(&target, "").unwrap();
-        for i in 0..(V2_SESSION_DIR_SCAN_CAP - 1) {
-            fs::write(dir.path().join(format!("other-{i}.txt")), "").unwrap();
-        }
-        assert_eq!(sole_jsonl_in_dir(dir.path()), Some(target));
-    }
-
-    #[test]
-    #[serial]
-    fn test_mine_v2_session_info_corrupt_first_line_still_mines_model_from_tail() {
-        // A corrupt/non-JSON header line must not abort mining entirely --
-        // session_id degrades to None (mirroring the outer caller's
-        // stable-hash fallback), but the model can still be recovered from
-        // the tail scan.
-        let cache_dir = TempDir::new().unwrap();
-        let workspace = TempDir::new().unwrap();
-        let workspace_path = workspace.path().canonicalize().unwrap();
-        let slug = v2_workspace_slug(&workspace_path.to_string_lossy());
-        let session_dir = cache_dir
-            .path()
-            .join(".augment")
-            .join("sessions-v2")
-            .join(format!("--{}--", slug));
-        fs::create_dir_all(&session_dir).unwrap();
-        let session_file = session_dir.join("corrupt-session.jsonl");
-        fs::write(
-            &session_file,
-            "not even json\n{\"type\":\"model_change\",\"modelId\":\"recovered-model\"}\n",
-        )
-        .unwrap();
-
-        unsafe {
-            std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
-        }
-        let mined = mine_v2_session_info(&workspace_path);
-        unsafe {
-            std::env::remove_var("AUGMENT_CACHE_DIR");
-        }
-
-        assert_eq!(mined.session_id, None);
-        assert_eq!(mined.model, Some("recovered-model".to_string()));
-    }
-
-    #[test]
-    #[serial]
-    fn test_mine_v2_session_info_respects_tail_bound_ignores_head_only_model() {
-        // Proves the tail bound is real (not an accidental full-file read):
-        // a model_change entry placed only in the file's head, followed by
-        // enough padding to push it beyond V2_SESSION_TAIL_BYTES from the
-        // end, must NOT be found -- if the implementation regressed to a
-        // full-file scan, this would incorrectly return the head model.
-        let cache_dir = TempDir::new().unwrap();
-        let workspace = TempDir::new().unwrap();
-        let workspace_path = workspace.path().canonicalize().unwrap();
-        let slug = v2_workspace_slug(&workspace_path.to_string_lossy());
-        let session_dir = cache_dir
-            .path()
-            .join(".augment")
-            .join("sessions-v2")
-            .join(format!("--{}--", slug));
-        fs::create_dir_all(&session_dir).unwrap();
-        let session_file = session_dir.join("oversized-session.jsonl");
-
-        let mut content = String::new();
-        content.push_str("{\"type\":\"session\",\"id\":\"big-session\"}\n");
-        content.push_str("{\"type\":\"model_change\",\"modelId\":\"should-be-invisible\"}\n");
-        // Pad well past the tail bound with lines carrying no model info,
-        // so the only model_change entry ends up strictly in the head.
-        let filler_line = format!(
-            "{{\"type\":\"message\",\"text\":\"{}\"}}\n",
-            "x".repeat(200)
-        );
-        let filler_bytes_needed = (V2_SESSION_TAIL_BYTES as usize) + 8192;
-        while content.len() < filler_bytes_needed {
-            content.push_str(&filler_line);
-        }
-        fs::write(&session_file, &content).unwrap();
-
-        unsafe {
-            std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
-        }
-        let mined = mine_v2_session_info(&workspace_path);
-        unsafe {
-            std::env::remove_var("AUGMENT_CACHE_DIR");
-        }
-
-        // Header id is still readable (only the first line is read for it).
-        assert_eq!(mined.session_id, Some("big-session".to_string()));
-        // The head-only model_change fell outside the tail window.
-        assert_eq!(mined.model, None);
     }
 }
