@@ -96,14 +96,24 @@
 //!     for free (confirmed live) — simpler than v1's JSON field read.
 //!   - **Session id / model (MVP tier)**: best-effort mining of the
 //!     on-disk `~/.augment/sessions-v2/--<cwd-slug>--/*.jsonl` session
-//!     file (newest-mtime file for the workspace; header `id` for the
-//!     session id, tail-scanned `model_change`/message `model` for the
-//!     live model). This is undocumented internal file format, not a
-//!     contract — mining is strictly best-effort, bounded (newest file
+//!     file (header `id` for the session id, tail-scanned
+//!     `model_change`/message `model` for the live model), but ONLY when
+//!     exactly one `*.jsonl` file exists for the workspace. The v2 hook
+//!     payload carries no session identifier (see above), so if more
+//!     than one session file is present — e.g. two concurrently active
+//!     `auggie-v2` sessions in the same workspace, or leftover history —
+//!     there is no way to tell which file belongs to the *current*
+//!     invocation. Picking the newest-mtime file in that case would risk
+//!     silently attributing this hook to a DIFFERENT, concurrently
+//!     active session (wrong `external_session_id` and model), so mining
+//!     fails closed instead of guessing whenever the candidate file is
+//!     ambiguous. This is undocumented internal file format, not a
+//!     contract — mining is strictly best-effort, bounded (sole file
 //!     only, tail-only read, never an unbounded scan), and NEVER blocks
-//!     or slows the parse path: any failure degrades to a stable
-//!     `generate_session_id(cwd, "augment")` hash and `model: "unknown"`,
-//!     mirroring the v1 preset's own missing-metadata fallback.
+//!     or slows the parse path: any failure or ambiguity degrades to a
+//!     stable `generate_session_id(cwd, "augment")` hash and
+//!     `model: "unknown"`, mirroring the v1 preset's own
+//!     missing-metadata fallback.
 //!   - **Tool classification**: v2's default toolset names happen to
 //!     coincide with Claude's (`write`/`edit`/`bash`) — added directly to
 //!     the existing `Agent::Augment` arm in `classify_tool` (no v1/v2
@@ -128,7 +138,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 pub struct AugmentPreset;
 
@@ -549,29 +558,39 @@ fn v2_agent_dir() -> PathBuf {
         .unwrap_or_else(|| crate::mdm::utils::home_dir().join(".augment"))
 }
 
-/// Hard cap on directory entries `latest_jsonl_in_dir` will examine per
+/// Hard cap on directory entries `sole_jsonl_in_dir` will examine per
 /// call. A workspace's `sessions-v2/--<slug>--/` directory accumulates one
 /// file per historical session and is never pruned, so an unbounded
-/// `read_dir` + per-entry `metadata()` stat would make cost grow with a
-/// workspace's entire session history instead of staying O(1) per hook
-/// invocation. 512 comfortably covers realistic day-to-day session counts
-/// for a single workspace while still bounding worst-case work to a few
-/// hundred stats; if a directory has more entries than this, mining bails
-/// out (see below) rather than scan it.
+/// `read_dir` pass would make cost grow with a workspace's entire session
+/// history instead of staying O(1) per hook invocation. 512 comfortably
+/// covers realistic day-to-day session counts for a single workspace
+/// while still bounding worst-case work to a few hundred directory
+/// entries; if a directory has more entries than this, mining bails out
+/// (see below) rather than scan it — we cannot otherwise be sure no
+/// second `*.jsonl` file exists further down the (unordered) listing.
 const V2_SESSION_DIR_SCAN_CAP: usize = 512;
 
-/// Returns the newest-mtime `*.jsonl` file directly inside `dir`, or
-/// `None` if the directory is missing/empty/unreadable *or* holds more
-/// than `V2_SESSION_DIR_SCAN_CAP` entries. Single, non-recursive directory
-/// listing, bounded to constant work regardless of how many historical
-/// session files have accumulated for a workspace: once the cap is
-/// exceeded we give up and return `None` rather than let the scan scale
-/// with session history. Callers already degrade gracefully on `None`
-/// (regenerated session id + "unknown" model), so this is a safe fail-open
-/// in the "too many sessions" case.
-fn latest_jsonl_in_dir(dir: &Path) -> Option<PathBuf> {
+/// Returns the sole `*.jsonl` file directly inside `dir`, or `None` if
+/// the directory is missing/empty/unreadable, holds more than
+/// `V2_SESSION_DIR_SCAN_CAP` entries, or contains more than one `*.jsonl`
+/// file. Single, non-recursive directory listing, bounded to constant
+/// work regardless of how many historical session files have accumulated
+/// for a workspace.
+///
+/// Deliberately does NOT fall back to "pick the newest by mtime" when
+/// more than one candidate exists: the v2 hook payload carries no session
+/// identifier, so with two-or-more session files present (e.g. a second,
+/// concurrently active `auggie-v2` session in the same workspace) there
+/// is no defensible way to tell which one belongs to the *current*
+/// invocation. Picking by mtime risks silently attributing this hook to
+/// a DIFFERENT session's `external_session_id`/model. Callers already
+/// degrade gracefully on `None` (regenerated session id + "unknown"
+/// model), so failing closed on ambiguity (or on a too-large directory,
+/// where uniqueness can't be confirmed within the scan cap) is the safe
+/// choice.
+fn sole_jsonl_in_dir(dir: &Path) -> Option<PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
-    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    let mut found: Option<PathBuf> = None;
     for (count, entry) in entries.enumerate() {
         if count >= V2_SESSION_DIR_SCAN_CAP {
             // Directory has more entries than we're willing to scan;
@@ -583,15 +602,14 @@ fn latest_jsonl_in_dir(dir: &Path) -> Option<PathBuf> {
         if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
             continue;
         }
-        let modified = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
-            newest = Some((modified, path));
+        if found.is_some() {
+            // A second candidate makes the choice ambiguous -- refuse to
+            // guess which session file belongs to this invocation.
+            return None;
         }
+        found = Some(path);
     }
-    newest.map(|(_, p)| p)
+    found
 }
 
 /// Reads at most the last `max_bytes` of `path`, lossily decoded as UTF-8.
@@ -642,16 +660,20 @@ fn extract_model_from_tail(tail: &str, truncated: bool) -> Option<String> {
 
 /// Best-effort mining of `~/.augment/sessions-v2/--<cwd-slug>--/` for the
 /// current workspace's session id and live model name. Never fails loudly:
-/// any I/O error, missing directory, or malformed content simply yields
-/// `None` for the affected field. See the module docs for the full
-/// rationale and the MVP-vs-full-parity tradeoff.
+/// any I/O error, missing directory, unreadable/ambiguous session file, or
+/// malformed content simply yields `None` for the affected field. See the
+/// module docs for the full rationale and the MVP-vs-full-parity tradeoff.
 fn mine_v2_session_info(workspace_root: &Path) -> MinedV2SessionInfo {
     let cwd_str = workspace_root.to_string_lossy();
     let session_dir = v2_agent_dir()
         .join("sessions-v2")
         .join(format!("--{}--", v2_workspace_slug(&cwd_str)));
 
-    let Some(session_file) = latest_jsonl_in_dir(&session_dir) else {
+    // Only mine when exactly one session file exists for this workspace --
+    // with two or more candidates (e.g. a concurrently active second
+    // session) there is no way to tell which one this hook belongs to, so
+    // fail closed to the caller's safe fallback rather than guess.
+    let Some(session_file) = sole_jsonl_in_dir(&session_dir) else {
         return MinedV2SessionInfo::default();
     };
 
@@ -1358,7 +1380,18 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_mine_v2_session_info_picks_newest_mtime_file() {
+    fn test_mine_v2_session_info_refuses_to_guess_between_competing_same_workspace_sessions() {
+        // Regression for discussion_r3942067002: two session files in the
+        // same workspace directory simulate a second, concurrently active
+        // `auggie-v2` session (or stale leftover history) alongside the
+        // "current" one. The v2 hook payload carries no session
+        // identifier, so there is no defensible way to know which file
+        // belongs to *this* invocation. Picking by newest mtime (the old,
+        // pre-fix behavior) would silently attribute this hook to
+        // whichever session happened to write most recently -- merging
+        // unrelated checkpoints under the wrong `external_session_id`/
+        // model. The fix must fail closed to the safe MVP fallback
+        // (`None`/`None`, i.e. regenerated id + "unknown" model) instead.
         let cache_dir = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
         let workspace_path = workspace.path().canonicalize().unwrap();
@@ -1370,13 +1403,22 @@ mod tests {
             .join(format!("--{}--", slug));
         fs::create_dir_all(&session_dir).unwrap();
 
-        let older = session_dir.join("older.jsonl");
-        fs::write(&older, "{\"type\":\"session\",\"id\":\"old-id\"}\n").unwrap();
-        // Ensure a distinguishable mtime ordering regardless of filesystem
-        // timestamp resolution.
+        // "other" is the concurrently active session that happens to have
+        // the newest mtime -- the exact case that used to win under the
+        // old newest-mtime selection.
+        let mine = session_dir.join("mine.jsonl");
+        fs::write(
+            &mine,
+            "{\"type\":\"session\",\"id\":\"my-real-session-id\"}\n",
+        )
+        .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let newer = session_dir.join("newer.jsonl");
-        fs::write(&newer, "{\"type\":\"session\",\"id\":\"new-id\"}\n").unwrap();
+        let other = session_dir.join("other.jsonl");
+        fs::write(
+            &other,
+            "{\"type\":\"session\",\"id\":\"someone-elses-session-id\"}\n",
+        )
+        .unwrap();
 
         unsafe {
             std::env::set_var("AUGMENT_CACHE_DIR", cache_dir.path().join(".augment"));
@@ -1386,7 +1428,9 @@ mod tests {
             std::env::remove_var("AUGMENT_CACHE_DIR");
         }
 
-        assert_eq!(mined.session_id, Some("new-id".to_string()));
+        // Must NOT pick either session's id/model -- ambiguous means
+        // "unknown", never a guess.
+        assert_eq!(mined, MinedV2SessionInfo::default());
     }
 
     #[test]
@@ -1773,47 +1817,62 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_latest_jsonl_in_dir_empty_dir_returns_none() {
+    fn test_sole_jsonl_in_dir_empty_dir_returns_none() {
         let dir = TempDir::new().unwrap();
-        assert_eq!(latest_jsonl_in_dir(dir.path()), None);
+        assert_eq!(sole_jsonl_in_dir(dir.path()), None);
     }
 
     #[test]
-    fn test_latest_jsonl_in_dir_bails_out_past_scan_cap() {
+    fn test_sole_jsonl_in_dir_single_file_returns_it() {
+        let dir = TempDir::new().unwrap();
+        let only = dir.path().join("session.jsonl");
+        fs::write(&only, "").unwrap();
+        assert_eq!(sole_jsonl_in_dir(dir.path()), Some(only));
+    }
+
+    #[test]
+    fn test_sole_jsonl_in_dir_multiple_files_returns_none() {
+        // Regression for discussion_r3942067002: more than one `*.jsonl`
+        // candidate (e.g. a second, concurrently active session in the
+        // same workspace) is ambiguous -- the v2 hook payload carries no
+        // session identifier to disambiguate them, so mining must refuse
+        // to guess (never fall back to "pick the newest by mtime").
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.jsonl"), "").unwrap();
+        fs::write(dir.path().join("b.jsonl"), "").unwrap();
+        assert_eq!(sole_jsonl_in_dir(dir.path()), None);
+    }
+
+    #[test]
+    fn test_sole_jsonl_in_dir_bails_out_past_scan_cap() {
         // Proves the directory scan is capped, not proportional to
         // historical session count: with more entries than
         // V2_SESSION_DIR_SCAN_CAP present, mining must give up (None)
-        // rather than pay an unbounded read_dir + per-entry metadata()
-        // stat pass. A regression back to `.max_by_key()` over the full
-        // iterator would still return the newest file here instead of
-        // bailing out.
+        // rather than pay an unbounded read_dir pass, even when there is
+        // only one genuine `*.jsonl` candidate among the entries -- past
+        // the cap we can no longer be sure a second candidate isn't
+        // lurking further down the (unordered) listing, so we bail rather
+        // than risk silently trusting a false "sole file" result.
         let dir = TempDir::new().unwrap();
-        for i in 0..(V2_SESSION_DIR_SCAN_CAP + 1) {
-            fs::write(dir.path().join(format!("session-{i}.jsonl")), "").unwrap();
+        fs::write(dir.path().join("session.jsonl"), "").unwrap();
+        for i in 0..V2_SESSION_DIR_SCAN_CAP {
+            fs::write(dir.path().join(format!("other-{i}.txt")), "").unwrap();
         }
-        assert_eq!(latest_jsonl_in_dir(dir.path()), None);
+        assert_eq!(sole_jsonl_in_dir(dir.path()), None);
     }
 
     #[test]
-    fn test_latest_jsonl_in_dir_scans_normally_at_or_under_cap() {
+    fn test_sole_jsonl_in_dir_scans_normally_at_or_under_cap() {
         // Preserves existing behavior for realistic (small/normal)
-        // directories: exactly at the cap, the newest file is still
-        // correctly identified rather than spuriously bailing out.
+        // directories: at or under the cap, the sole `*.jsonl` file is
+        // still correctly identified rather than spuriously bailing out.
         let dir = TempDir::new().unwrap();
-        for i in 0..V2_SESSION_DIR_SCAN_CAP {
-            let path = dir.path().join(format!("session-{i}.jsonl"));
-            fs::write(&path, "").unwrap();
-            // Force strictly increasing mtimes so the last-written file is
-            // unambiguously the newest one across filesystems with coarse
-            // mtime resolution.
-            let t = SystemTime::now() + std::time::Duration::from_secs(i as u64);
-            let ft = filetime::FileTime::from_system_time(t);
-            filetime::set_file_mtime(&path, ft).unwrap();
+        let target = dir.path().join("session.jsonl");
+        fs::write(&target, "").unwrap();
+        for i in 0..(V2_SESSION_DIR_SCAN_CAP - 1) {
+            fs::write(dir.path().join(format!("other-{i}.txt")), "").unwrap();
         }
-        let newest = dir
-            .path()
-            .join(format!("session-{}.jsonl", V2_SESSION_DIR_SCAN_CAP - 1));
-        assert_eq!(latest_jsonl_in_dir(dir.path()), Some(newest));
+        assert_eq!(sole_jsonl_in_dir(dir.path()), Some(target));
     }
 
     #[test]
