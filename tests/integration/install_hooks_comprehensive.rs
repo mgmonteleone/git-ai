@@ -221,6 +221,113 @@ fn test_to_hashmap_all_statuses() {
 // Argument Parsing Tests
 // ==============================================================================
 
+/// Bounded retry for the Linux fork+exec race where executing a just-copied
+/// binary can transiently fail with `ETXTBSY` ("Text file busy", raw OS error
+/// 26) even though our own `fs::copy` into `installed_binary` has already
+/// fully completed and closed its file handle.
+///
+/// This is NOT a flush/sync delay on our own copy: `fork()` duplicates a
+/// process's *entire* file descriptor table, so if some unrelated,
+/// concurrently running integration test thread calls `Command::spawn()` at
+/// just the wrong moment, its forked child can transiently inherit a
+/// writable file descriptor this test held open on `installed_binary` while
+/// `fs::copy` was writing it. The kernel refuses to `execve()` a file that
+/// ANY process still has open for writing, so our own exec is rejected with
+/// ETXTBSY until that unrelated child calls its own `exec()` (or exits) and
+/// drops the inherited fd -- typically within milliseconds. See the upstream
+/// analyses at https://github.com/rust-lang/rust/issues/114554 and
+/// https://github.com/golang/go/issues/22315.
+///
+/// Only a bare `raw_os_error() == 26` (ETXTBSY) is retried; every other
+/// error -- including a successful spawn that later exits non-zero -- is
+/// returned from the very first attempt, and after `attempts` consecutive
+/// ETXTBSY failures the last ETXTBSY error is returned instead of retrying
+/// forever.
+fn retry_on_etxtbsy<T>(
+    attempts: usize,
+    delay: std::time::Duration,
+    mut op: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    assert!(attempts >= 1, "must attempt at least once");
+    let mut last_etxtbsy = None;
+    for attempt in 0..attempts {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if err.raw_os_error() == Some(26) => {
+                if attempt + 1 < attempts {
+                    std::thread::sleep(delay);
+                }
+                last_etxtbsy = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_etxtbsy.expect("loop body always sets last_etxtbsy before falling through"))
+}
+
+#[cfg(test)]
+mod retry_on_etxtbsy_tests {
+    use super::retry_on_etxtbsy;
+    use std::cell::Cell;
+    use std::io::Error;
+    use std::time::Duration;
+
+    #[test]
+    fn returns_immediately_on_success() {
+        let calls = Cell::new(0);
+        let result = retry_on_etxtbsy(5, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            Ok::<_, Error>(42)
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls.get(), 1, "must not retry a successful call");
+    }
+
+    #[test]
+    fn does_not_retry_other_errors() {
+        let calls = Cell::new(0);
+        let result = retry_on_etxtbsy(5, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            Err::<i32, _>(Error::from_raw_os_error(2)) // ENOENT
+        });
+        let err = result.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(2));
+        assert_eq!(calls.get(), 1, "non-ETXTBSY errors must not be retried");
+    }
+
+    #[test]
+    fn retries_until_success() {
+        let calls = Cell::new(0);
+        let result = retry_on_etxtbsy(5, Duration::ZERO, || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n < 3 {
+                Err(Error::from_raw_os_error(26)) // ETXTBSY
+            } else {
+                Ok(n)
+            }
+        });
+        assert_eq!(result.unwrap(), 3);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn returns_last_error_after_exhausting_attempts() {
+        let calls = Cell::new(0);
+        let result = retry_on_etxtbsy(4, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            Err::<i32, _>(Error::from_raw_os_error(26))
+        });
+        let err = result.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(26));
+        assert_eq!(
+            calls.get(),
+            4,
+            "must attempt exactly `attempts` times before giving up"
+        );
+    }
+}
+
 #[test]
 fn plain_install_hooks_preserves_the_invoking_user_home() {
     let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
@@ -253,7 +360,10 @@ fn plain_install_hooks_preserves_the_invoking_user_home() {
         .env("APPDATA", invoking_home.join("AppData").join("Roaming"))
         .env("LOCALAPPDATA", invoking_home.join("AppData").join("Local"));
 
-    let output = command.output().expect("run copied git-ai binary");
+    let output = retry_on_etxtbsy(20, std::time::Duration::from_millis(25), || {
+        command.output()
+    })
+    .expect("run copied git-ai binary");
     assert!(
         output.status.success(),
         "plain install-hooks failed: {}",
