@@ -143,6 +143,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get install -y mold
 
+      - name: Validate Windows exit-code propagation (regression, CSS-2302)
+        if: runner.os == 'Windows' && matrix.mode == 'windows-core'
+        shell: pwsh
+        run: |
+          & ./scripts/test-windows-exit-propagation.ps1
+
       - name: Run tests (Unix)
         if: runner.os != 'Windows'
         shell: bash
