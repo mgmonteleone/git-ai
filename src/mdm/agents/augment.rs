@@ -144,10 +144,11 @@ impl AugmentInstaller {
         params: &HookInstallerParams,
         dry_run: bool,
     ) -> Result<Option<String>, GitAiError> {
-        if let Some(dir) = settings_path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-
+        // Do NOT create the parent directory here: this function must be a
+        // pure no-op filesystem-wise when `dry_run` is true. The real write
+        // path (`write_atomic`, below) already ensures the parent directory
+        // exists before it writes, so nothing is lost for the non-dry-run
+        // case.
         let existing_content = if settings_path.exists() {
             fs::read_to_string(settings_path)?
         } else {
@@ -687,6 +688,41 @@ mod tests {
         let diff = AugmentInstaller::install_hooks_at(&path, &params(), true).unwrap();
         assert!(diff.is_some(), "dry run still computes a diff");
         assert!(!path.exists(), "dry run must not write the file");
+    }
+
+    #[test]
+    fn s9_dry_run_fresh_target_does_not_create_parent_dir() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join(".augment").join("settings.json");
+        assert!(!path.parent().unwrap().exists());
+
+        let diff = AugmentInstaller::install_hooks_at(&path, &params(), true).unwrap();
+        assert!(diff.is_some(), "dry run still computes a diff");
+        assert!(
+            !path.parent().unwrap().exists(),
+            "dry run must not create the parent directory"
+        );
+        assert!(!path.exists(), "dry run must not write the file");
+    }
+
+    #[test]
+    fn s10_dry_run_existing_settings_no_mutation() {
+        let (_td, path) = setup_test_env();
+        let initial = r#"{"hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": "echo not ours"}]}]}}"#;
+        fs::write(&path, initial).unwrap();
+
+        let diff = AugmentInstaller::install_hooks_at(&path, &params(), true).unwrap();
+        assert!(diff.is_some(), "dry run still computes a diff");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            initial,
+            "dry run must not modify existing settings bytes"
+        );
+        let tmp_path = path.with_extension("tmp");
+        assert!(
+            !tmp_path.exists(),
+            "dry run must not create backup/temp artifacts"
+        );
     }
 
     #[test]
