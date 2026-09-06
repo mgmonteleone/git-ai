@@ -575,6 +575,25 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// A platform-native absolute path for v2 path-extraction tests.
+    ///
+    /// `Path::is_absolute()` requires a drive/UNC prefix on Windows, so a
+    /// bare POSIX-style `/tmp/...` fixture is NOT absolute there and gets
+    /// re-rooted under the test process's cwd by `resolve_absolute` --
+    /// that re-rooting is *correct* Windows semantics (a real Windows
+    /// `auggie-v2` payload sends native `C:\...` paths, which pass
+    /// through unchanged the same way `/tmp/...` does on POSIX). The bug
+    /// was in the test fixtures hardcoding a POSIX-only path, not in the
+    /// production absolute-path check, so the fix is a platform-native
+    /// fixture rather than weakening `resolve_absolute` (CSS-2302).
+    fn native_abs_path(rel: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\{}", rel.replace('/', "\\"))
+        } else {
+            format!("/{}", rel)
+        }
+    }
+
     fn make_hook_input(event: &str, tool: &str, tool_input: serde_json::Value) -> String {
         json!({
             "hook_event_name": event,
@@ -949,13 +968,25 @@ mod tests {
 
     #[test]
     fn test_augment_autodetects_v2_shape_from_hook_type() {
-        // [live] real captured PostToolUse write payload.
-        let input = r#"{"hook_type":"PostToolUse","tool_name":"write","tool_input":{"path":"/tmp/proj/bar2.txt","content":"test2"},"tool_result":[{"type":"text","text":"Successfully wrote 5 bytes to bar2.txt"}],"tool_is_error":false}"#;
-        let events = AugmentPreset.parse(input, "t_test").unwrap();
+        // [live] real captured PostToolUse write payload (path swapped for
+        // a platform-native absolute path -- see `native_abs_path`).
+        let path = native_abs_path("tmp/proj/bar2.txt");
+        let input = json!({
+            "hook_type": "PostToolUse",
+            "tool_name": "write",
+            "tool_input": {"path": path, "content": "test2"},
+            "tool_result": [{"type": "text", "text": "Successfully wrote 5 bytes to bar2.txt"}],
+            "tool_is_error": false,
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
         match &events[0] {
             ParsedHookEvent::PostFileEdit(e) => {
                 assert_eq!(e.context.agent_id.tool, "augment");
-                assert_eq!(e.file_paths, vec![PathBuf::from("/tmp/proj/bar2.txt")]);
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from(native_abs_path("tmp/proj/bar2.txt"))]
+                );
             }
             _ => panic!("Expected PostFileEdit"),
         }
@@ -1011,17 +1042,25 @@ mod tests {
 
     #[test]
     fn test_augment_v2_pre_write_extracts_path() {
-        // [live] real captured PreToolUse write payload (path made absolute
-        // for a deterministic assertion independent of the test process's
-        // actual cwd).
-        let input = r#"{"hook_type":"PreToolUse","tool_name":"write","tool_input":{"path":"/tmp/proj/bar2.txt","content":"test2"}}"#;
-        let events = AugmentPreset.parse(input, "t_test123456789a").unwrap();
+        // [live] real captured PreToolUse write payload (path swapped for
+        // a platform-native absolute path -- see `native_abs_path`).
+        let path = native_abs_path("tmp/proj/bar2.txt");
+        let input = json!({
+            "hook_type": "PreToolUse",
+            "tool_name": "write",
+            "tool_input": {"path": path, "content": "test2"},
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&input, "t_test123456789a").unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             ParsedHookEvent::PreFileEdit(e) => {
                 assert_eq!(e.context.agent_id.tool, "augment");
                 assert_eq!(e.context.trace_id, "t_test123456789a");
-                assert_eq!(e.file_paths, vec![PathBuf::from("/tmp/proj/bar2.txt")]);
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from(native_abs_path("tmp/proj/bar2.txt"))]
+                );
                 assert!(e.dirty_files.is_none());
                 // No mining fixture is set up for this test's cwd, so the
                 // MVP fallback path must produce a stable, non-empty
@@ -1040,11 +1079,27 @@ mod tests {
         // true in the original capture -- still checkpointed the same as
         // a successful edit; actual attribution is diff-based, so a
         // failed edit that changed nothing produces no spurious lines).
-        let input = r#"{"hook_type":"PostToolUse","tool_name":"edit","tool_input":{"path":"/tmp/proj/bar2.txt","edits":[{"oldText":"a","newText":"b"}]},"tool_result":[{"type":"text","text":"error"}],"tool_is_error":true}"#;
-        let events = AugmentPreset.parse(input, "t_test").unwrap();
+        // Path swapped for a platform-native absolute path -- see
+        // `native_abs_path`.
+        let path = native_abs_path("tmp/proj/bar2.txt");
+        let input = json!({
+            "hook_type": "PostToolUse",
+            "tool_name": "edit",
+            "tool_input": {
+                "path": path,
+                "edits": [{"oldText": "a", "newText": "b"}],
+            },
+            "tool_result": [{"type": "text", "text": "error"}],
+            "tool_is_error": true,
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
         match &events[0] {
             ParsedHookEvent::PostFileEdit(e) => {
-                assert_eq!(e.file_paths, vec![PathBuf::from("/tmp/proj/bar2.txt")]);
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from(native_abs_path("tmp/proj/bar2.txt"))]
+                );
                 assert!(e.stream_source.is_none());
             }
             _ => panic!("Expected PostFileEdit"),
@@ -1226,9 +1281,15 @@ mod tests {
         }
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let cwd_str = cwd.to_string_lossy();
+        // On Windows `cwd_str` starts with a drive letter + `:` (e.g.
+        // `C:\Users\...`); `:` is not valid inside a Windows path
+        // component (only as the drive separator at position 1), so it
+        // must be sanitized like the path separators below or
+        // `fs::create_dir_all` fails closed with a NotADirectory-ish IO
+        // error before the fixture is even set up (CSS-2302).
         let slug = cwd_str
             .trim_start_matches(['/', '\\'])
-            .replace(['/', '\\'], "-");
+            .replace([':', '/', '\\'], "-");
         let session_dir = cache_dir
             .path()
             .join(".augment")
@@ -1583,12 +1644,22 @@ mod tests {
     #[test]
     fn test_augment_v2_absolute_path_passes_through_unchanged() {
         // v2's workspace root is env::current_dir(); an already-absolute
-        // tool_input.path must not be re-rooted under it.
-        let input = r#"{"hook_type":"PreToolUse","tool_name":"write","tool_input":{"path":"/etc/hosts","content":""}}"#;
-        let events = AugmentPreset.parse(input, "t_test").unwrap();
+        // tool_input.path must not be re-rooted under it. Path swapped for
+        // a platform-native absolute path -- see `native_abs_path`.
+        let path = native_abs_path("etc/hosts");
+        let input = json!({
+            "hook_type": "PreToolUse",
+            "tool_name": "write",
+            "tool_input": {"path": path, "content": ""},
+        })
+        .to_string();
+        let events = AugmentPreset.parse(&input, "t_test").unwrap();
         match &events[0] {
             ParsedHookEvent::PreFileEdit(e) => {
-                assert_eq!(e.file_paths, vec![PathBuf::from("/etc/hosts")]);
+                assert_eq!(
+                    e.file_paths,
+                    vec![PathBuf::from(native_abs_path("etc/hosts"))]
+                );
             }
             _ => panic!("Expected PreFileEdit"),
         }
