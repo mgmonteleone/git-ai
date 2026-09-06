@@ -1394,6 +1394,24 @@ mod tests {
         )
     }
 
+    /// Kill deadline for the partial-output timeout test below.
+    ///
+    /// On Windows, `powershell.exe` cold-start (process creation + CLR init)
+    /// on CI runners can itself exceed the tight 300ms budget that's plenty
+    /// on Unix for `sh`, causing the child to be killed before it ever
+    /// writes to stdout/stderr -- an empty-capture false failure, not the
+    /// timeout/kill/partial-output behavior under test. Give Windows a few
+    /// seconds of startup headroom while keeping the Unix budget tight.
+    #[cfg(not(windows))]
+    fn partial_output_timeout() -> Duration {
+        Duration::from_millis(300)
+    }
+
+    #[cfg(windows)]
+    fn partial_output_timeout() -> Duration {
+        Duration::from_secs(3)
+    }
+
     #[test]
     fn test_validate_trace2_command_events_accepts_expected_events() {
         let trace = r#"{"event":"version"}
@@ -1456,7 +1474,7 @@ mod tests {
     fn test_run_logged_command_with_timeout_reports_partial_output() {
         let (program, args) = stdout_stderr_sleep_command();
         let record =
-            run_logged_command_with_timeout(program, &args, None, Duration::from_millis(300));
+            run_logged_command_with_timeout(program, &args, None, partial_output_timeout());
 
         assert!(record.timed_out, "{record:?}");
         assert_eq!(record.stdout, "out");
