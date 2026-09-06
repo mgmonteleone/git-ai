@@ -34,9 +34,12 @@
 
     Every extracted block is run as a real child `pwsh` process under an
     explicit, bounded timeout (see $ChildProcessTimeoutSeconds below). A
-    child that hangs is killed (its full process tree, via taskkill /T /F)
-    and reported as its own distinct failure -- never misread as an
-    expected core/doc-test exit code.
+    child that hangs has its full process tree killed via the .NET runtime's
+    own Process.Kill($true) (never by shelling out to a second, equally
+    killable process such as taskkill.exe), the kill is confirmed by a
+    bounded WaitForExit, and the child is reported as its own distinct
+    failure -- never misread as an expected core/doc-test exit code, and
+    never treated as a pass unless that cleanup is actually confirmed.
 
     Additional focused self-checks (exercising the harness's own failure
     paths, not the workflow script) are run alongside the four scenarios
@@ -80,19 +83,35 @@ $ChildProcessTimeoutSeconds = 30
 function Stop-ProcessTree {
     <#
     Best-effort kill of a process and its full descendant tree, using the
-    platform's own process-management facility (taskkill.exe, shipped with
-    every Windows install -- no added dependency/tool). `/T` recurses into
-    child processes, `/F` forces termination. Never throws: this is called
-    only during timeout cleanup, where the target process may already be
-    exiting on its own.
+    .NET runtime's own Process.Kill($true) rather than shelling out to
+    taskkill.exe. Killing via a spawned external process is itself an
+    unbounded operation -- if taskkill.exe stalls (contested handles,
+    driver hangs, etc.) the harness would be stuck waiting on a *second*
+    process it doesn't control, which defeats the purpose of a bounded
+    kill. Kill($true) is a direct, synchronous, non-spawning termination of
+    the process and its full descendant tree (supported since .NET Core
+    3.0 / pwsh 7+, which this harness already requires), so there is no
+    subprocess of our own that can itself hang.
+
+    Returns $true if the kill call completed without throwing (the
+    termination signal was issued), $false otherwise (e.g. the process had
+    already exited on its own). This is a best-effort signal only -- it is
+    NOT proof the process has actually exited. Callers MUST still bound-wait
+    via WaitForExit and use its return value as the real, authoritative
+    confirmation that cleanup succeeded before treating the timeout as
+    handled.
     #>
-    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process)
 
     try {
-        & taskkill.exe /PID $ProcessId /T /F 2>$null | Out-Null
+        $Process.Kill($true)
+        return $true
     }
     catch {
-        # best-effort; nothing more we can do here
+        # best-effort; the process may have already exited on its own, or
+        # termination may have been denied. Either way, the caller's
+        # bounded WaitForExit below is what actually confirms cleanup.
+        return $false
     }
 }
 
@@ -230,8 +249,10 @@ function Invoke-RunBlock {
         blocked synchronously reading the other stream, or blocked in
         WaitForExit before either stream is drained).
       - WaitForExit(timeout-ms) bounds the wait; on timeout the full process
-        tree is force-killed (Stop-ProcessTree) and the cleanup wait itself
-        is bounded, so a wedged child can never hang the harness.
+        tree is force-killed (Stop-ProcessTree) and the cleanup itself is
+        confirmed via a second bounded WaitForExit whose result is recorded
+        as CleanupVerified, so a wedged child -- or a wedged kill -- can
+        never hang the harness or be silently misread as a clean pass.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ScriptBody,
@@ -267,6 +288,7 @@ function Invoke-RunBlock {
     $proc = $null
     $timedOut = $false
     $exitCode = $null
+    $cleanupVerified = $false
     $stdoutBuilder = New-Object System.Text.StringBuilder
     $stderrBuilder = New-Object System.Text.StringBuilder
     $outSubscription = $null
@@ -313,12 +335,26 @@ function Invoke-RunBlock {
         $timedOut = -not $exitedInTime
 
         if ($timedOut) {
-            Stop-ProcessTree -ProcessId $proc.Id
-            # Bounded cleanup wait: the tree is already being force-killed,
-            # this just gives the OS a moment to finish tearing it down so
-            # the redirected-stream handles can close cleanly. Never blocks
-            # indefinitely even if the kill itself is incomplete.
-            $null = $proc.WaitForExit(5000)
+            $killIssued = Stop-ProcessTree -Process $proc
+            # Bounded cleanup wait: this is the ONLY authoritative signal
+            # that cleanup actually succeeded. Stop-ProcessTree not throwing
+            # only means the termination signal was issued, not that the
+            # process (or its tree) has actually gone away -- so its return
+            # value is never treated as proof of cleanup on its own. Never
+            # blocks indefinitely even if the kill itself is incomplete.
+            $cleanupVerified = $proc.WaitForExit(5000)
+            if ($cleanupVerified) {
+                # Drain any remaining async stream events now that the
+                # process is confirmed gone, mirroring the non-timeout path.
+                $proc.WaitForExit()
+            }
+            elseif (-not $killIssued) {
+                # Both the kill attempt and the bounded wait failed -- the
+                # process is very likely still alive. Surface this distinctly
+                # so a stalled kill is never silently conflated with an
+                # ordinary timeout.
+                Write-Host "  [warning] Stop-ProcessTree failed to signal termination for PID $($proc.Id), and it did not exit within the bounded cleanup wait"
+            }
         }
         else {
             # No-arg overload after the timed overload returns true is the
@@ -326,6 +362,9 @@ function Invoke-RunBlock {
             # have fully drained before we read $proc.ExitCode.
             $proc.WaitForExit()
             $exitCode = $proc.ExitCode
+            # The process exited on its own within the timeout -- there is
+            # nothing to kill/clean up, so cleanup is trivially satisfied.
+            $cleanupVerified = $true
         }
     }
     finally {
@@ -366,11 +405,12 @@ function Invoke-RunBlock {
     }
 
     return [PSCustomObject]@{
-        ExitCode   = $exitCode
-        TimedOut   = $timedOut
-        Calls      = $callLog
-        StdOutPath = $stdoutPath
-        StdErrPath = $stderrPath
+        ExitCode        = $exitCode
+        TimedOut        = $timedOut
+        CleanupVerified = $cleanupVerified
+        Calls           = $callLog
+        StdOutPath      = $stdoutPath
+        StdErrPath      = $stderrPath
     }
 }
 
@@ -415,8 +455,12 @@ try {
         if ($result.TimedOut) {
             # A timeout is never a valid stand-in for an expected core/doc
             # exit code -- report it as its own failure mode instead of
-            # comparing $result.ExitCode (which is $null here).
-            $failures.Add("[$Name] child pwsh process timed out unexpectedly (harness bug or genuine hang) -- see $($result.StdOutPath) / $($result.StdErrPath)")
+            # comparing $result.ExitCode (which is $null here). Also surface
+            # whether cleanup itself was verified: an unverified cleanup on
+            # top of an unexpected timeout means a real orphan process may
+            # still be running.
+            $cleanupNote = if ($result.CleanupVerified) { "cleanup verified" } else { "CLEANUP NOT VERIFIED -- possible orphan process" }
+            $failures.Add("[$Name] child pwsh process timed out unexpectedly (harness bug or genuine hang); $cleanupNote -- see $($result.StdOutPath) / $($result.StdErrPath)")
             $ok = $false
         }
         else {
@@ -467,7 +511,8 @@ try {
         -LogPath $logPath -CoreExitCode 17 -DocExitCode 0
 
     if ($baselineResult.TimedOut) {
-        $failures.Add("[baseline] child pwsh process timed out unexpectedly while running the $KnownBuggyBaselineRef script body -- see $($baselineResult.StdOutPath) / $($baselineResult.StdErrPath)")
+        $cleanupNote = if ($baselineResult.CleanupVerified) { "cleanup verified" } else { "CLEANUP NOT VERIFIED -- possible orphan process" }
+        $failures.Add("[baseline] child pwsh process timed out unexpectedly while running the $KnownBuggyBaselineRef script body ($cleanupNote) -- see $($baselineResult.StdOutPath) / $($baselineResult.StdErrPath)")
         Write-Host "  FAIL"
     }
     elseif ($baselineResult.ExitCode -eq 0 -and $baselineResult.Calls.Count -eq 2) {
@@ -515,8 +560,16 @@ try {
         $failures.Add("[timeout self-check] expected the harness to detect and kill a hanging child within 2s, but TimedOut=$($timeoutResult.TimedOut) exitcode=$($timeoutResult.ExitCode)")
         Write-Host "  FAIL"
     }
+    elseif (-not $timeoutResult.CleanupVerified) {
+        # A timeout alone is not enough to call this a pass: it must also be
+        # true that the kill was confirmed and the child actually exited
+        # within the bounded cleanup wait. Otherwise this self-check could
+        # pass with a live orphan `Start-Sleep` process still running.
+        $failures.Add("[timeout self-check] child was detected as hung, but cleanup was not verified within the bounded wait (kill may have failed and the process may still be alive) -- CleanupVerified=$($timeoutResult.CleanupVerified)")
+        Write-Host "  FAIL"
+    }
     else {
-        Write-Host "  PASS (hanging child was killed and reported as a timeout, not misread as a pass/fail)"
+        Write-Host "  PASS (hanging child was killed, cleanup verified, and reported as a timeout, not misread as a pass/fail)"
     }
 
     if ($failures.Count -gt 0) {
