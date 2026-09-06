@@ -3,12 +3,12 @@
 use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
 use git_ai::authorship::stats::CommitStats;
 use git_ai::config::ConfigPatch;
+#[cfg(not(unix))]
+use git_ai::daemon::DaemonLock;
 use git_ai::daemon::{
     ControlRequest, DaemonClientStream, DaemonConfig, local_socket_connects_with_timeout,
     open_local_socket_stream_with_timeout, send_control_request, send_control_request_with_timeout,
 };
-#[cfg(not(unix))]
-use git_ai::daemon::DaemonLock;
 use git_ai::feature_flags::FeatureFlags;
 use git_ai::git::cli_parser::{ParsedGitInvocation, extract_clone_target_directory};
 use git_ai::git::repo_storage::PersistedWorkingLog;
