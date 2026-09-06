@@ -40,6 +40,19 @@ const AUGMENT_CHECKPOINT_CMD: &str = "checkpoint augment --hook-input stdin";
 const AUGMENT_HOOK_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
 const AUGMENT_CATCH_ALL_MATCHER: &str = ".*";
 
+/// Executable names for every supported Augment Code CLI generation: v1
+/// (`auggie`) and v2 (`auggie-v2`, and its `cosmos-agent` kernel binary).
+/// `process_names` and tool-installed detection both derive from this list
+/// so they can never drift apart (CSS-2302).
+const AUGMENT_PROCESS_NAMES: [&str; 3] = ["auggie", "auggie-v2", "cosmos-agent"];
+
+/// Returns true if any supported Augment CLI executable name resolves via
+/// `exists`. Takes an injectable existence-check function so this name
+/// selection logic is unit-testable without mutating the real process PATH.
+fn any_supported_binary_exists(exists: impl Fn(&str) -> bool) -> bool {
+    AUGMENT_PROCESS_NAMES.iter().any(|name| exists(name))
+}
+
 /// Returns true only for git-ai hooks belonging to *this* preset
 /// (`git-ai checkpoint augment ...`). The shared
 /// `is_git_ai_checkpoint_command` helper matches any
@@ -137,6 +150,48 @@ impl AugmentInstaller {
             .iter()
             .all(|e| up_to_date_events.contains(e));
         (hooks_installed, hooks_up_to_date)
+    }
+
+    /// Core of `check_hooks`, with the binary-existence check and dotfile
+    /// presence injected as plain values rather than read from the real
+    /// process PATH / home directory. This keeps the fresh-v2-only-install
+    /// regression (and its siblings) fast, deterministic, and free of the
+    /// global-PATH-mutation races that binary-on-PATH integration tests
+    /// require (CSS-2302).
+    fn check_hooks_with(
+        binary_check: impl Fn(&str) -> bool,
+        has_dotfiles: bool,
+        settings_path: &Path,
+        params: &HookInstallerParams,
+    ) -> Result<HookCheckResult, GitAiError> {
+        let has_binary = any_supported_binary_exists(binary_check);
+
+        if !has_binary && !has_dotfiles {
+            return Ok(HookCheckResult {
+                tool_installed: false,
+                hooks_installed: false,
+                hooks_up_to_date: false,
+            });
+        }
+
+        if !settings_path.exists() {
+            return Ok(HookCheckResult {
+                tool_installed: true,
+                hooks_installed: false,
+                hooks_up_to_date: false,
+            });
+        }
+
+        let content = fs::read_to_string(settings_path)?;
+        let existing: Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
+        let desired_cmd = Self::desired_command(&params.binary_path);
+        let (hooks_installed, hooks_up_to_date) = Self::hook_status(&existing, &desired_cmd);
+
+        Ok(HookCheckResult {
+            tool_installed: true,
+            hooks_installed,
+            hooks_up_to_date,
+        })
     }
 
     fn install_hooks_at(
@@ -388,40 +443,16 @@ impl HookInstaller for AugmentInstaller {
     }
 
     fn process_names(&self) -> Vec<&str> {
-        vec!["auggie"]
+        AUGMENT_PROCESS_NAMES.to_vec()
     }
 
     fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError> {
-        let has_binary = binary_exists("auggie");
-        let has_dotfiles = Self::config_dir().exists();
-
-        if !has_binary && !has_dotfiles {
-            return Ok(HookCheckResult {
-                tool_installed: false,
-                hooks_installed: false,
-                hooks_up_to_date: false,
-            });
-        }
-
-        let settings_path = Self::settings_path();
-        if !settings_path.exists() {
-            return Ok(HookCheckResult {
-                tool_installed: true,
-                hooks_installed: false,
-                hooks_up_to_date: false,
-            });
-        }
-
-        let content = fs::read_to_string(&settings_path)?;
-        let existing: Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
-        let desired_cmd = Self::desired_command(&params.binary_path);
-        let (hooks_installed, hooks_up_to_date) = Self::hook_status(&existing, &desired_cmd);
-
-        Ok(HookCheckResult {
-            tool_installed: true,
-            hooks_installed,
-            hooks_up_to_date,
-        })
+        Self::check_hooks_with(
+            binary_exists,
+            Self::config_dir().exists(),
+            &Self::settings_path(),
+            params,
+        )
     }
 
     fn install_hooks(
@@ -1013,5 +1044,125 @@ mod tests {
         let (installed, up_to_date) = AugmentInstaller::hook_status(&v, &cmd);
         assert!(installed);
         assert!(!up_to_date);
+    }
+
+    // ---- v2-only fresh install detection (CSS-2302) ----
+    //
+    // `any_supported_binary_exists` / `check_hooks_with` take an injected
+    // existence-check closure instead of touching the real process PATH,
+    // so these are plain, parallel-safe unit tests (no `#[serial]`, no
+    // env mutation).
+
+    #[test]
+    fn process_names_matches_supported_binary_detection() {
+        // Guards against the two lists drifting apart: whichever names
+        // `process_names` advertises are exactly the names the detector
+        // checks.
+        let installer = AugmentInstaller;
+        assert_eq!(installer.process_names(), AUGMENT_PROCESS_NAMES.to_vec());
+    }
+
+    #[test]
+    fn any_supported_binary_exists_true_for_v1_only() {
+        assert!(any_supported_binary_exists(|name| name == "auggie"));
+    }
+
+    #[test]
+    fn any_supported_binary_exists_true_for_auggie_v2_only() {
+        assert!(any_supported_binary_exists(|name| name == "auggie-v2"));
+    }
+
+    #[test]
+    fn any_supported_binary_exists_true_for_cosmos_agent_only() {
+        assert!(any_supported_binary_exists(|name| name == "cosmos-agent"));
+    }
+
+    #[test]
+    fn any_supported_binary_exists_false_when_none_present() {
+        assert!(!any_supported_binary_exists(|_| false));
+    }
+
+    #[test]
+    fn fresh_auggie_v2_only_install_is_tool_installed() {
+        // Regression for the reported bug: a fresh v2-only host has the
+        // `auggie-v2` executable on PATH but no v1 `auggie`, and no
+        // `~/.augment` settings directory yet (never configured before).
+        // Before the fix this fell through both branches of the
+        // `!has_binary && !has_dotfiles` check and reported `NotFound`,
+        // which made the install runner skip writing hooks entirely.
+        let (_td, settings_path) = setup_test_env();
+        let missing_settings_path = settings_path.parent().unwrap().join("nonexistent.json");
+        let result = AugmentInstaller::check_hooks_with(
+            |name| name == "auggie-v2",
+            /* has_dotfiles */ false,
+            &missing_settings_path,
+            &params(),
+        )
+        .unwrap();
+        assert!(
+            result.tool_installed,
+            "fresh auggie-v2-only install must be detected as tool_installed"
+        );
+        assert!(!result.hooks_installed);
+    }
+
+    #[test]
+    fn fresh_cosmos_agent_only_install_is_tool_installed() {
+        let (_td, settings_path) = setup_test_env();
+        let missing_settings_path = settings_path.parent().unwrap().join("nonexistent.json");
+        let result = AugmentInstaller::check_hooks_with(
+            |name| name == "cosmos-agent",
+            false,
+            &missing_settings_path,
+            &params(),
+        )
+        .unwrap();
+        assert!(
+            result.tool_installed,
+            "fresh cosmos-agent-only install must be detected as tool_installed"
+        );
+    }
+
+    #[test]
+    fn fresh_v1_only_install_is_still_tool_installed() {
+        // Retain existing v1 detection behavior.
+        let (_td, settings_path) = setup_test_env();
+        let missing_settings_path = settings_path.parent().unwrap().join("nonexistent.json");
+        let result = AugmentInstaller::check_hooks_with(
+            |name| name == "auggie",
+            false,
+            &missing_settings_path,
+            &params(),
+        )
+        .unwrap();
+        assert!(result.tool_installed);
+    }
+
+    #[test]
+    fn dotfile_fallback_detected_with_no_binary_on_path() {
+        // Retain existing dotfile-fallback behavior: no supported binary
+        // resolves, but `~/.augment` already exists (e.g. prior install).
+        let (_td, settings_path) = setup_test_env();
+        let result = AugmentInstaller::check_hooks_with(
+            |_| false,
+            /* has_dotfiles */ true,
+            &settings_path, // settings.json itself doesn't exist yet
+            &params(),
+        )
+        .unwrap();
+        assert!(result.tool_installed);
+        assert!(!result.hooks_installed);
+    }
+
+    #[test]
+    fn no_binary_and_no_dotfiles_is_not_installed() {
+        let (_td, settings_path) = setup_test_env();
+        let missing_settings_path = settings_path.parent().unwrap().join("nonexistent.json");
+        let result =
+            AugmentInstaller::check_hooks_with(|_| false, false, &missing_settings_path, &params())
+                .unwrap();
+        assert!(!result.tool_installed);
+        assert!(!result.hooks_installed);
+        assert!(!result.hooks_up_to_date);
     }
 }
