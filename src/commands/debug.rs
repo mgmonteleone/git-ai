@@ -1583,8 +1583,8 @@ mod tests {
     #[test]
     fn test_run_command_capture_with_timeout_reports_partial_output() {
         let (program, args) = stdout_stderr_sleep_command();
-        let err = run_command_capture_with_timeout(program, &args, partial_output_timeout())
-            .unwrap_err();
+        let err =
+            run_command_capture_with_timeout(program, &args, partial_output_timeout()).unwrap_err();
 
         assert!(err.contains("timed out after"), "{err}");
         assert!(

@@ -785,7 +785,11 @@ mod tests {
             };
             let managed_pre_content = ClineInstaller::generate_hook_script(&params.binary_path);
             let unmanaged_post_content = "#!/bin/sh\necho 'user hook'\n";
-            fs::write(ClineInstaller::hook_path(PRE_HOOK_NAME), &managed_pre_content).unwrap();
+            fs::write(
+                ClineInstaller::hook_path(PRE_HOOK_NAME),
+                &managed_pre_content,
+            )
+            .unwrap();
             fs::write(
                 ClineInstaller::hook_path(POST_HOOK_NAME),
                 unmanaged_post_content,
