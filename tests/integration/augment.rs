@@ -12,11 +12,14 @@
 //!     `file_paths[]` for `remove-files`, `command` for `launch-process`
 
 use crate::repos::test_file::ExpectedLineExt;
-use crate::repos::test_repo::TestRepo;
+use crate::repos::test_repo::{TestRepo, get_binary_path};
 use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
 use git_ai::error::GitAiError;
 use serde_json::json;
 use std::fs;
+use std::io::Write;
+use std::process::{Command, Stdio};
+use tempfile::TempDir;
 
 fn parse_augment(hook_input: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
     resolve_preset("augment")?.parse(hook_input, "t_test123456789a")
@@ -829,5 +832,313 @@ fn test_augment_handler_wrong_type_discriminator_reports_actionable_stderr() {
     assert!(
         output.contains("hook_event_name must be a string"),
         "expected an actionable diagnostic for a wrong-type discriminator, got: {output:?}"
+    );
+}
+
+// ============================================================================
+// Real Auggie hook-dispatch regression (CSS-2302)
+//
+// The e2e tests above invoke `git-ai checkpoint augment` directly as a
+// subprocess of the *default* compiled test binary. None of them exercise
+// the actual command Auggie's installer writes into
+// `~/.augment/settings.json`, nor the real algorithm Auggie's hook executor
+// (`hook-executor.ts` / `hook-executor-platform.ts` in augmentcode/augment,
+// read-only reference) uses to turn that command string into a spawned
+// process.
+//
+// Per https://docs.augmentcode.com/cli/hooks, `hooks[].hooks[].command` is
+// documented as "a path to the script to execute (must use a supported
+// script extension: .ps1, .cmd, .bat, or .sh)". Auggie's *actual* hook
+// executor is more permissive than the docs suggest:
+// `parseWindowsCommand`/`parseUnixCommand` in hook-executor-platform.ts only
+// special-case a command whose first token ends in one of those four
+// extensions (routed through powershell.exe / bash.exe / cmd.exe) or one
+// that contains a shell metacharacter (`|&;><$` or a backtick, routed
+// through cmd.exe /c or bash -c). git-ai's installer-generated command
+// (`'<binary path>' checkpoint augment --hook-input stdin`) is neither: its
+// first token is the git-ai binary itself (`.exe` on Windows, no extension
+// on Unix), and it contains no shell metacharacters. Both platform branches
+// therefore fall through to the SAME `splitCommand` quote-aware tokenizer
+// and spawn the result directly with `shell: false` -- no OS shell is ever
+// involved for this command, on Windows OR Unix.
+//
+// The test below verifies those two preconditions against the REAL
+// installer output (so a future installer change that adds a shell
+// metacharacter or a script extension is caught), reproduces
+// `splitCommand`'s tokenization faithfully in Rust, and spawns the
+// resulting argv exactly as Auggie would: no shell, with the git-ai binary
+// copied to a path containing a space (a realistic install location, e.g.
+// "Program Files"). This code path runs unmodified on Unix and Windows:
+// unlike the OS-level CreateProcess/execve syscalls (which do differ), the
+// argv-splitting algorithm exercised here is the identical,
+// platform-independent logic Auggie runs on both operating systems for this
+// specific command shape. Running it in this Linux sandbox is therefore
+// genuine evidence for the Windows dispatch outcome, but it is NOT a
+// substitute for an actual Windows OS-level process spawn -- that still
+// requires the hosted Windows CI matrix.
+// ============================================================================
+
+/// Faithful port of `getFirstToken` in `hook-executor-platform.ts`
+/// (augmentcode/augment, read-only reference).
+fn augment_get_first_token(command: &str) -> &str {
+    if let Some(rest) = command.strip_prefix('"')
+        && let Some(end) = rest.find('"')
+    {
+        return &rest[..end];
+    }
+    if let Some(rest) = command.strip_prefix('\'')
+        && let Some(end) = rest.find('\'')
+    {
+        return &rest[..end];
+    }
+    match command.find(' ') {
+        Some(idx) => &command[..idx],
+        None => command,
+    }
+}
+
+/// Faithful port of `hasShellMetacharacters` (same file as above).
+fn augment_has_shell_metacharacters(command: &str) -> bool {
+    command.starts_with('~') || command.chars().any(|c| "|&;><$`".contains(c))
+}
+
+/// Faithful port of `splitCommand` (same file as above): a quote-aware
+/// tokenizer that is NOT a real shell word-splitter -- unlike a POSIX
+/// shell, it does not understand `'\''`-escaped quotes inside a
+/// single-quoted segment. This is Auggie's actual fallback for a command
+/// with spaces and no shell metacharacters, used identically on Windows
+/// and Unix (both `parseWindowsCommand` and `parseUnixCommand` delegate to
+/// it).
+fn augment_split_command(command: &str) -> (String, Vec<String>) {
+    let re = regex::Regex::new(r#""([^"]*(?:\\.[^"]*)*)"|'([^']*(?:\\.[^']*)*)'|(\S+)"#).unwrap();
+    let mut parts = Vec::new();
+    for cap in re.captures_iter(command) {
+        let token = cap
+            .get(1)
+            .or_else(|| cap.get(2))
+            .or_else(|| cap.get(3))
+            .expect("regex alternation always captures exactly one group");
+        parts.push(token.as_str().to_string());
+    }
+    if parts.is_empty() {
+        return (command.to_string(), Vec::new());
+    }
+    (parts[0].clone(), parts[1..].to_vec())
+}
+
+#[test]
+fn test_augment_installer_command_spacey_path_dispatches_without_shell_and_checkpoints() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("app.py");
+    fs::write(&file_path, "def hello():\n    pass\n").unwrap();
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    // Copy the compiled test binary to an install location containing a
+    // space -- a realistic "Program Files"-style path (the exact scenario
+    // from AugmentInstaller's `q2`/`q4` unit tests, now exercised through
+    // the real installer + real dispatch instead of just the
+    // string-building helper).
+    let install_root = TempDir::new().unwrap();
+    let spacey_dir = install_root
+        .path()
+        .join("Program Files")
+        .join("git-ai install");
+    fs::create_dir_all(&spacey_dir).unwrap();
+    let exe_name = if cfg!(windows) {
+        "git-ai.exe"
+    } else {
+        "git-ai"
+    };
+    let spacey_binary = spacey_dir.join(exe_name);
+    fs::copy(get_binary_path(), &spacey_binary).unwrap();
+
+    // Isolated HOME for the installer subprocess: pre-create `.augment/` so
+    // AugmentInstaller's dotfile fallback (`check_hooks_with`) reports
+    // tool_installed=true without needing a real `auggie`/`auggie-v2`/
+    // `cosmos-agent` on PATH -- a realistic "Augment CLI configured before,
+    // hooks not yet installed" scenario.
+    let install_home = TempDir::new().unwrap();
+    fs::create_dir_all(install_home.path().join(".augment")).unwrap();
+    let install_test_db = install_home.path().join("install-hooks.db");
+
+    // Run the REAL `git-ai install-hooks` CLI *as* the spacey-path binary,
+    // so the installer's own `get_current_binary_path()`
+    // (`std::env::current_exe()`) naturally resolves to the spacey path --
+    // exactly reproducing what a real user gets installing git-ai there.
+    let mut install_cmd = Command::new(&spacey_binary);
+    install_cmd
+        .arg("install-hooks")
+        .current_dir(install_home.path())
+        .env("HOME", install_home.path())
+        .env("GIT_AI_TEST_DB_PATH", &install_test_db)
+        .env("GITAI_TEST_DB_PATH", &install_test_db)
+        .env("GIT_CONFIG_GLOBAL", install_home.path().join(".gitconfig"))
+        .env("GIT_AI_ALLOW_SUPERUSER", "1")
+        .env("GIT_AI_DEBUG", "0");
+    #[cfg(windows)]
+    install_cmd
+        .env("USERPROFILE", install_home.path())
+        .env(
+            "APPDATA",
+            install_home.path().join("AppData").join("Roaming"),
+        )
+        .env(
+            "LOCALAPPDATA",
+            install_home.path().join("AppData").join("Local"),
+        );
+    let install_output = install_cmd
+        .output()
+        .expect("git-ai install-hooks must spawn");
+    assert!(
+        install_output.status.success(),
+        "git-ai install-hooks failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&install_output.stdout),
+        String::from_utf8_lossy(&install_output.stderr),
+    );
+
+    let settings_path = install_home.path().join(".augment").join("settings.json");
+    assert!(
+        settings_path.exists(),
+        "installer must write ~/.augment/settings.json for a detected Augment install"
+    );
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let desired_cmd = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse hooks must be an array")
+        .iter()
+        .flat_map(|block| block["hooks"].as_array().cloned().unwrap_or_default())
+        .find_map(|hook| {
+            hook.get("command")
+                .and_then(|c| c.as_str())
+                .filter(|cmd| cmd.contains("checkpoint augment --hook-input stdin"))
+                .map(|s| s.to_string())
+        })
+        .expect("augment PreToolUse hook command must be present after install");
+
+    // Determine (don't assume) which of Auggie's real dispatch branches
+    // applies: neither a dispatch-script extension nor a shell
+    // metacharacter is present, so both parseWindowsCommand and
+    // parseUnixCommand fall through to the identical splitCommand +
+    // spawn(shell:false) path.
+    let first_token = augment_get_first_token(&desired_cmd).to_ascii_lowercase();
+    for ext in [".ps1", ".sh", ".bat", ".cmd"] {
+        assert!(
+            !first_token.ends_with(ext),
+            "installer command's first token carries a dispatch-script \
+             extension ({ext}); Auggie would route this through a script \
+             interpreter instead of the direct spawn(shell:false) fallback \
+             this test exercises -- got: {desired_cmd}"
+        );
+    }
+    assert!(
+        !augment_has_shell_metacharacters(&desired_cmd),
+        "installer command contains a shell metacharacter; Auggie would wrap \
+         it in cmd.exe /c or bash -c instead of the direct spawn(shell:false) \
+         fallback this test exercises -- got: {desired_cmd}"
+    );
+
+    let (program, args) = augment_split_command(&desired_cmd);
+    let expected_program = spacey_binary.to_string_lossy().replace('\\', "/");
+    assert_eq!(
+        program, expected_program,
+        "Auggie's real tokenizer must resolve the quoted spacey path as a \
+         single argv[0] token, not split it at the space"
+    );
+    assert_eq!(args, vec!["checkpoint", "augment", "--hook-input", "stdin"]);
+
+    // Build the realistic PostToolUse save-file hook payload (same shape as
+    // `test_augment_e2e_save_file_attributes_to_augment` above).
+    fs::write(
+        &file_path,
+        "def hello():\n    pass\ndef world():\n    pass\n",
+    )
+    .unwrap();
+    let canonical_root = repo.canonical_path();
+    let canonical_file = canonical_root.join("app.py");
+    let hook_input = json!({
+        "hook_event_name": "PostToolUse",
+        "conversation_id": "augment-windows-dispatch-1",
+        "workspace_roots": [canonical_root.to_string_lossy().to_string()],
+        "tool_name": "save-file",
+        "tool_input": {
+            "path": canonical_file.to_string_lossy().to_string(),
+            "content": "def hello():\n    pass\ndef world():\n    pass\n",
+        },
+    })
+    .to_string();
+
+    // Spawn EXACTLY as Auggie's hook-executor.ts does: no shell, argv
+    // resolved by `parseCommand`, event JSON written to stdin then closed.
+    // Env/cwd match what a normal `repo.git_ai(...)` call would use (same
+    // per-test daemon sockets/db path), harvested from the test harness's
+    // own command builder via the stable `Command::get_envs`/
+    // `get_current_dir` introspection so this test never needs its own
+    // copy of that (private, intentionally non-public) wiring.
+    let baseline = repo.git_ai_command_without_pre_sync_for_test(&[], &[]);
+    let mut hook_cmd = Command::new(&program);
+    hook_cmd.args(&args);
+    if let Some(dir) = baseline.get_current_dir() {
+        hook_cmd.current_dir(dir);
+    }
+    for (key, value) in baseline.get_envs() {
+        match value {
+            Some(v) => hook_cmd.env(key, v),
+            None => hook_cmd.env_remove(key),
+        };
+    }
+    hook_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = hook_cmd
+        .spawn()
+        .expect("real dispatch must spawn the copied binary");
+    child
+        .stdin
+        .take()
+        .expect("stdin must be piped")
+        .write_all(hook_input.as_bytes())
+        .expect("write hook JSON to stdin");
+    let output = child.wait_with_output().expect("wait for hook process");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "checkpoint via real dispatch must exit 0: stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "checkpoint via real dispatch must not print diagnostics for a \
+         well-formed save-file event, got stderr: {stderr}"
+    );
+
+    // Assert an ACTUAL checkpoint effect -- exit 0 alone proves nothing
+    // (handle_checkpoint exits 0 even on malformed input): the working log
+    // must now contain a real checkpoint entry, and after committing, the
+    // new line must be attributed to Augment, not left as unattributed
+    // human/untracked content.
+    let checkpoints = repo.current_working_logs().read_all_checkpoints().unwrap();
+    assert!(
+        !checkpoints.is_empty(),
+        "expected a real checkpoint entry to be recorded via the real dispatch path"
+    );
+
+    let commit = repo
+        .stage_all_and_commit("Add world function via real dispatch")
+        .expect("commit should succeed");
+
+    let mut file = repo.filename("app.py");
+    file.assert_lines_and_blame(crate::lines![
+        "def hello():".human(),
+        "    pass".human(),
+        "def world():".ai(),
+        "    pass".ai(),
+    ]);
+    assert!(
+        !commit.authorship_log.attestations.is_empty(),
+        "Should have AI attestations from the real installer-dispatched checkpoint"
     );
 }
