@@ -29,7 +29,8 @@
 use crate::error::GitAiError;
 use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
 use crate::mdm::utils::{
-    binary_exists, generate_diff, home_dir, is_git_ai_checkpoint_command, write_atomic,
+    binary_exists, generate_diff, home_dir, is_git_ai_checkpoint_command,
+    normalize_windows_path_for_shell, write_atomic,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -71,8 +72,24 @@ impl AugmentInstaller {
         Self::config_dir().join("settings.json")
     }
 
+    /// Quote a shell path if it contains characters that would otherwise
+    /// be split or reinterpreted by a POSIX-style shell (spaces, quotes,
+    /// backslashes, etc). Mirrors `GitHubCopilotInstaller::shell_quote_path`.
+    fn shell_quote_path(path: &str) -> String {
+        if path
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_./:=@".contains(character))
+        {
+            path.to_string()
+        } else {
+            format!("'{}'", path.replace('\'', "'\\''"))
+        }
+    }
+
     fn desired_command(binary_path: &Path) -> String {
-        format!("{} {}", binary_path.display(), AUGMENT_CHECKPOINT_CMD)
+        let normalized = normalize_windows_path_for_shell(binary_path);
+        let quoted = Self::shell_quote_path(&normalized);
+        format!("{quoted} {AUGMENT_CHECKPOINT_CMD}")
     }
 
     /// Returns `(hooks_installed, hooks_up_to_date)`.
@@ -780,6 +797,155 @@ mod tests {
         fs::write(&path, "[]").unwrap();
         let result = AugmentInstaller::install_hooks_at(&path, &params(), false);
         assert!(result.is_err());
+    }
+
+    // ---- desired_command quoting / normalization ----
+
+    /// Minimal POSIX-shell word splitter, sufficient for asserting how a
+    /// real shell would tokenize the commands this installer produces
+    /// (bare tokens plus single-quoted segments with `'\''`-escaped
+    /// embedded quotes). Not a general-purpose shell parser.
+    fn split_shell_command(cmd: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        let mut in_word = false;
+        let mut chars = cmd.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                ' ' | '\t' => {
+                    if in_word {
+                        words.push(std::mem::take(&mut current));
+                        in_word = false;
+                    }
+                }
+                '\'' => {
+                    in_word = true;
+                    for c2 in chars.by_ref() {
+                        if c2 == '\'' {
+                            break;
+                        }
+                        current.push(c2);
+                    }
+                }
+                '\\' => {
+                    in_word = true;
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                _ => {
+                    in_word = true;
+                    current.push(c);
+                }
+            }
+        }
+        if in_word {
+            words.push(current);
+        }
+        words
+    }
+
+    #[test]
+    fn q1_unquoted_for_plain_path() {
+        // No special characters: no quoting needed, matches historical output.
+        let cmd = AugmentInstaller::desired_command(Path::new("/usr/local/bin/git-ai"));
+        assert_eq!(
+            cmd,
+            "/usr/local/bin/git-ai checkpoint augment --hook-input stdin"
+        );
+    }
+
+    #[test]
+    fn q2_quotes_path_with_spaces() {
+        let path = Path::new("/opt/My Apps/git-ai");
+        let cmd = AugmentInstaller::desired_command(path);
+        // The binary path must be a single shell token so the shell does not
+        // split it at the space and try to invoke a nonexistent `/opt/My`.
+        assert_eq!(
+            cmd,
+            "'/opt/My Apps/git-ai' checkpoint augment --hook-input stdin"
+        );
+        // Sanity-check argv splitting matches intent: exactly one path token.
+        let argv = split_shell_command(&cmd);
+        assert_eq!(argv[0], "/opt/My Apps/git-ai");
+        assert_eq!(argv[1], "checkpoint");
+        assert_eq!(argv[2], "augment");
+    }
+
+    #[test]
+    fn q3_escapes_embedded_single_quote() {
+        let path = Path::new("/opt/it's-mine/git-ai");
+        let cmd = AugmentInstaller::desired_command(path);
+        // POSIX single-quote escaping: close the quote, escape the quote
+        // char, reopen.
+        assert!(cmd.starts_with("'/opt/it'\\''s-mine/git-ai' "), "{cmd}");
+        let argv = split_shell_command(&cmd);
+        assert_eq!(argv[0], "/opt/it's-mine/git-ai");
+    }
+
+    #[test]
+    fn q4_normalizes_and_quotes_windows_path_with_spaces() {
+        // A realistic Windows install location with spaces and backslashes
+        // (the exact case from review comment discussion_r3942062953).
+        let path = Path::new(r"C:\Program Files\git-ai\git-ai.exe");
+        let cmd = AugmentInstaller::desired_command(path);
+        // Backslashes are converted to forward slashes (git bash / PowerShell
+        // convention shared with normalize_windows_path_for_shell), and the
+        // whole path is quoted because it contains a space.
+        assert_eq!(
+            cmd,
+            "'C:/Program Files/git-ai/git-ai.exe' checkpoint augment --hook-input stdin"
+        );
+        let argv = split_shell_command(&cmd);
+        assert_eq!(argv[0], "C:/Program Files/git-ai/git-ai.exe");
+    }
+
+    #[test]
+    fn q5_windows_path_without_spaces_still_normalized_unquoted() {
+        let path = Path::new(r"C:\Users\bob\.git-ai\git-ai.exe");
+        let cmd = AugmentInstaller::desired_command(path);
+        assert_eq!(
+            cmd,
+            "C:/Users/bob/.git-ai/git-ai.exe checkpoint augment --hook-input stdin"
+        );
+    }
+
+    #[test]
+    fn q6_recognizes_quoted_command_as_our_own() {
+        // is_git_ai_augment_command must still recognize the (now-quoted)
+        // desired command, so reinstall/upgrade over a path with spaces
+        // stays idempotent instead of re-inserting a duplicate entry.
+        let cmd = AugmentInstaller::desired_command(Path::new("/opt/My Apps/git-ai"));
+        assert!(is_git_ai_augment_command(&cmd));
+    }
+
+    #[test]
+    fn q7_install_and_reinstall_idempotent_for_spacey_path() {
+        // End-to-end: installing twice against a path containing a space
+        // must not corrupt settings.json or duplicate the entry.
+        let (_td, path) = setup_test_env();
+        let spacey_params = HookInstallerParams {
+            binary_path: PathBuf::from("/opt/My Apps/git-ai"),
+        };
+
+        let diff1 = AugmentInstaller::install_hooks_at(&path, &spacey_params, false).unwrap();
+        assert!(diff1.is_some());
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("'/opt/My Apps/git-ai' checkpoint augment"),
+            "{content}"
+        );
+
+        let diff2 = AugmentInstaller::install_hooks_at(&path, &spacey_params, false).unwrap();
+        assert!(
+            diff2.is_none(),
+            "reinstall over a spacey path must be a no-op"
+        );
+
+        for event in &AUGMENT_HOOK_EVENTS {
+            assert_eq!(count_git_ai_entries(&read_event_blocks(&path, event)), 1);
+        }
     }
 
     // ---- hook_status (check_hooks helper) ----
