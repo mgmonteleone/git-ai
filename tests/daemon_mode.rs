@@ -1055,6 +1055,29 @@ fn dedicated_daemon_restart_rejects_pending_traced_command_for_test() {
 }
 
 #[test]
+fn dedicated_daemon_repeated_restart_does_not_race_daemon_lock() {
+    // Regression test for CSS-2302: on Windows, `DaemonProcess::shutdown()`
+    // used to return as soon as `taskkill /F` was issued, without waiting for
+    // the OS to actually release the outgoing daemon's exclusive `daemon.lock`
+    // handle. `restart_dedicated_daemon_for_test()` immediately starts a new
+    // daemon against the same test_home/lock path, so it could lose that race
+    // and fail with "git-ai background service is already running (lock
+    // held)" even though no other daemon or shard was actually contending for
+    // it. Repeated back-to-back restarts exercise that exact shutdown/restart
+    // boundary.
+    let mut repo = TestRepo::new_dedicated_daemon();
+
+    for _ in 0..5 {
+        repo.restart_dedicated_daemon_for_test();
+    }
+
+    // The daemon must still be genuinely usable after the restart loop.
+    fs::write(repo.path().join("after-restarts.txt"), "base\n").expect("failed to write base");
+    repo.stage_all_and_commit("base commit after restarts")
+        .expect("commit after repeated restarts should succeed");
+}
+
+#[test]
 #[serial]
 fn checkpoint_delegate_autostarts_daemon_when_unavailable() {
     // Test builds disable daemon auto-spawning from ensure_daemon_running to
