@@ -386,12 +386,19 @@ function Invoke-RunBlock {
         $proc = [System.Diagnostics.Process]::new()
         $proc.StartInfo = $psi
 
+        # CSS-2302: Register-ObjectEvent has no -PassThru parameter (see
+        # https://learn.microsoft.com/powershell/module/microsoft.powershell.utility/register-objectevent).
+        # It unconditionally returns the PSEventJob subscriber object, so the
+        # assignment below already captures it without -PassThru. The
+        # now-removed -PassThru was an unsupported/unbound parameter that
+        # triggered a terminating error under $ErrorActionPreference = "Stop",
+        # aborting the harness before any scenario ran (job101553166874).
         $outSubscription = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -MessageData $stdoutBuilder -Action {
             if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
-        } -PassThru
+        }
         $errSubscription = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -MessageData $stderrBuilder -Action {
             if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
-        } -PassThru
+        }
 
         if (-not $proc.Start()) {
             throw "Failed to start child pwsh process for $scriptFile (Process.Start returned false)"
@@ -593,6 +600,67 @@ try {
     else {
         $failures.Add("[baseline] expected the known-buggy $KnownBuggyBaselineRef script to mask a core failure (exit 0, 2 task calls), but got exit code $($baselineResult.ExitCode) with $($baselineResult.Calls.Count) call(s). This regression test's negative-control fixture may be stale.")
         Write-Host "  FAIL"
+    }
+
+    # --- Focused self-check: Invoke-RunBlock's Register-ObjectEvent-based
+    # stdout/stderr capture actually captures data, and both subscriptions
+    # are fully released afterwards (CSS-2302 round 3, job101553166874).
+    # Register-ObjectEvent has no -PassThru parameter; an unsupported/
+    # unbound -PassThru there is a terminating error under
+    # $ErrorActionPreference = "Stop" that aborts this whole harness before
+    # any scenario runs. The scenarios above would already fail outright if
+    # that regressed, but this check additionally proves the *substance* of
+    # the fix -- that data really flows from the child process through the
+    # OutputDataReceived/ErrorDataReceived event subscriptions into the
+    # capture builders, and that Unregister-Event in Invoke-RunBlock's
+    # finally block leaves no dangling subscriber behind -- rather than
+    # relying on the harness merely not crashing.
+    Write-Host "Running scenario: output capture via Register-ObjectEvent and subscription cleanup"
+    $captureWorkDir = Join-Path $tempRoot "capture-selfcheck"
+    New-Item -ItemType Directory -Path $captureWorkDir -Force | Out-Null
+    $stdoutMarker = "CSS2302_STDOUT_$([System.Guid]::NewGuid().ToString('N'))"
+    $stderrMarker = "CSS2302_STDERR_$([System.Guid]::NewGuid().ToString('N'))"
+    $captureBody = @"
+[Console]::Out.WriteLine('$stdoutMarker')
+[Console]::Error.WriteLine('$stderrMarker')
+exit 0
+"@
+
+    $subscribersBefore = @(Get-EventSubscriber -ErrorAction SilentlyContinue).Count
+    $captureResult = Invoke-RunBlock -ScriptBody $captureBody -WorkDir $captureWorkDir -FakeBinDir $fakeBinDir `
+        -LogPath $logPath -CoreExitCode 0 -DocExitCode 0
+    $subscribersAfter = @(Get-EventSubscriber -ErrorAction SilentlyContinue).Count
+
+    if ($captureResult.TimedOut) {
+        $failures.Add("[output capture self-check] child pwsh process timed out unexpectedly -- see $($captureResult.StdOutPath) / $($captureResult.StdErrPath)")
+        Write-Host "  FAIL"
+    }
+    else {
+        $captureOk = $true
+        if ($captureResult.ExitCode -ne 0) {
+            $failures.Add("[output capture self-check] expected exit code 0, got $($captureResult.ExitCode)")
+            $captureOk = $false
+        }
+        $capturedStdout = if (Test-Path $captureResult.StdOutPath) { Get-Content $captureResult.StdOutPath -Raw } else { "" }
+        $capturedStderr = if (Test-Path $captureResult.StdErrPath) { Get-Content $captureResult.StdErrPath -Raw } else { "" }
+        if ($capturedStdout -notmatch [regex]::Escape($stdoutMarker)) {
+            $failures.Add("[output capture self-check] OutputDataReceived capture did not record the expected stdout marker -- captured stdout: '$capturedStdout'")
+            $captureOk = $false
+        }
+        if ($capturedStderr -notmatch [regex]::Escape($stderrMarker)) {
+            $failures.Add("[output capture self-check] ErrorDataReceived capture did not record the expected stderr marker -- captured stderr: '$capturedStderr'")
+            $captureOk = $false
+        }
+        if ($subscribersAfter -ne $subscribersBefore) {
+            $failures.Add("[output capture self-check] event subscriber count changed from $subscribersBefore to $subscribersAfter after Invoke-RunBlock returned -- the OutputDataReceived/ErrorDataReceived subscriptions were not fully released by Unregister-Event")
+            $captureOk = $false
+        }
+        if ($captureOk) {
+            Write-Host "  PASS (stdout/stderr captured via Register-ObjectEvent and both subscriptions were cleaned up)"
+        }
+        else {
+            Write-Host "  FAIL"
+        }
     }
 
     # --- Focused self-check: the fail-closed baseline guard actually fails
