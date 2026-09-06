@@ -15,6 +15,7 @@ use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::{TestRepo, get_binary_path};
 use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
 use git_ai::error::GitAiError;
+use git_ai::mdm::utils::{clean_path, normalize_windows_path_for_shell};
 use serde_json::json;
 use std::fs;
 use std::io::Write;
@@ -939,10 +940,28 @@ fn test_augment_installer_command_spacey_path_dispatches_without_shell_and_check
     // the real installer + real dispatch instead of just the
     // string-building helper).
     let install_root = TempDir::new().unwrap();
-    let spacey_dir = install_root
-        .path()
-        .join("Program Files")
-        .join("git-ai install");
+
+    // On Unix, exercise a deterministic directory alias (raw path !=
+    // canonical path, same real file) so this regression test proves the
+    // canonicalize-before-compare fix locally on Linux too, not only via
+    // hosted macOS's inherent `/var` -> `/private/var` TempDir alias (the
+    // actual CSS-2302 regression). Windows is excluded: creating symlinks
+    // there typically needs elevated privileges/Developer Mode, and its
+    // canonicalization concern is the `\\?\` extended-length prefix
+    // (already handled by `clean_path`), not a directory alias.
+    #[cfg(unix)]
+    let alias_parent = TempDir::new().unwrap();
+    #[cfg(unix)]
+    let spacey_root = {
+        let alias = alias_parent.path().join("install-alias");
+        std::os::unix::fs::symlink(install_root.path(), &alias)
+            .expect("failed to create deterministic path-alias symlink");
+        alias
+    };
+    #[cfg(not(unix))]
+    let spacey_root = install_root.path().to_path_buf();
+
+    let spacey_dir = spacey_root.join("Program Files").join("git-ai install");
     fs::create_dir_all(&spacey_dir).unwrap();
     let exe_name = if cfg!(windows) {
         "git-ai.exe"
@@ -1039,11 +1058,37 @@ fn test_augment_installer_command_spacey_path_dispatches_without_shell_and_check
     );
 
     let (program, args) = augment_split_command(&desired_cmd);
-    let expected_program = spacey_binary.to_string_lossy().replace('\\', "/");
+    // The installer resolves its own executable identity via
+    // `get_current_binary_path()` (canonicalize + `clean_path`), then
+    // renders it with `normalize_windows_path_for_shell` -- mirror that
+    // exact pipeline here rather than comparing against the raw, pre-copy
+    // spacey path. This is a platform-generic fix (plain `Path::canonicalize`
+    // plus the installer's own helpers), not a macOS-only prefix hack, and it
+    // resolves BOTH hosted-CI alias classes actually observed for this test:
+    //   - macOS: the temp dir under `spacey_dir` is reached through a
+    //     `/var` -> `/private/var` symlink (`/private/var/folders/...` vs
+    //     `/var/folders/...` for the same file); `canonicalize` resolves the
+    //     symlink via `realpath`.
+    //   - Windows: GitHub-hosted runners report `%TEMP%` using the account's
+    //     NTFS 8.3 short name (`C:/Users/RUNNER~1/AppData/...` vs the real
+    //     long name `C:/Users/runneradmin/AppData/...` for the same file);
+    //     `canonicalize` resolves this too, since `GetFinalPathNameByHandleW`
+    //     is called with the default `FILE_NAME_NORMALIZED` flag, which
+    //     returns the normalized (long-name) form of every path component.
+    // Either way the real installed binary and the freshly copied
+    // `spacey_binary` are the same executable reached via two textually
+    // different (but canonically identical) paths; comparing raw strings
+    // falsely fails on that alias.
+    let expected_program = normalize_windows_path_for_shell(&clean_path(
+        spacey_binary
+            .canonicalize()
+            .expect("spacey_binary must exist and be resolvable after being copied"),
+    ));
     assert_eq!(
         program, expected_program,
         "Auggie's real tokenizer must resolve the quoted spacey path as a \
-         single argv[0] token, not split it at the space"
+         single argv[0] token, not split it at the space, and it must match \
+         the installer's canonicalized executable identity"
     );
     assert_eq!(args, vec!["checkpoint", "augment", "--hook-input", "stdin"]);
 
