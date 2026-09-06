@@ -26,11 +26,30 @@
     Negative control: the same "core fails" scenario is replayed against the
     known-buggy baseline script text (commit c2b4ac2), which is expected to
     mask the failure (exit 0, doc-test still invoked). If that expectation
-    ever stops holding, this regression's fixture is stale.
+    ever stops holding, this regression's fixture is stale. The baseline
+    MUST be reachable in this checkout (the workflow already checks out with
+    fetch-depth: 0, and this candidate is a descendant of c2b4ac2): if it is
+    not, that is an environment/setup failure, and this harness fails closed
+    (throws) rather than silently skipping the negative control.
 
-    Exits non-zero (failing the CI job) if any candidate assertion fails, or
-    if the extraction itself cannot locate the step (so a rename/reshape of
-    the workflow can't silently defeat this test).
+    Every extracted block is run as a real child `pwsh` process under an
+    explicit, bounded timeout (see $ChildProcessTimeoutSeconds below). A
+    child that hangs is killed (its full process tree, via taskkill /T /F)
+    and reported as its own distinct failure -- never misread as an
+    expected core/doc-test exit code.
+
+    Additional focused self-checks (exercising the harness's own failure
+    paths, not the workflow script) are run alongside the four scenarios
+    above:
+      - the fail-closed baseline check actually throws when handed a null
+        baseline body.
+      - a deliberately hanging child (under a short overridden timeout) is
+        detected, killed, and reported as a timeout rather than a pass/fail.
+
+    Exits non-zero (failing the CI job) if any candidate assertion fails, if
+    the baseline negative control is unreachable, if a child process times
+    out unexpectedly, or if the extraction itself cannot locate the step (so
+    a rename/reshape of the workflow can't silently defeat this test).
 
 .NOTES
     Requires local `pwsh` (to run the extracted script blocks as real native
@@ -49,6 +68,52 @@ $ErrorActionPreference = "Stop"
 $WorkflowRelativePath = ".github/workflows/test.yml"
 $KnownBuggyBaselineRef = "c2b4ac2faa589e67a5c62f58654973ca027c95bb"
 $StepNamePattern = '^\s*-\s+name:\s*Run tests \(Windows\)\s*$'
+
+# Upper bound on how long any single extracted-block child pwsh process may
+# run before the harness kills it and reports a timeout. The fake `task.cmd`
+# is instant, so real scenarios never approach this; it exists purely so a
+# future run-block shape (or a genuine hang in command resolution/PowerShell
+# startup) fails the CI job quickly instead of hanging until the runner's
+# own default job timeout.
+$ChildProcessTimeoutSeconds = 30
+
+function Stop-ProcessTree {
+    <#
+    Best-effort kill of a process and its full descendant tree, using the
+    platform's own process-management facility (taskkill.exe, shipped with
+    every Windows install -- no added dependency/tool). `/T` recurses into
+    child processes, `/F` forces termination. Never throws: this is called
+    only during timeout cleanup, where the target process may already be
+    exiting on its own.
+    #>
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    try {
+        & taskkill.exe /PID $ProcessId /T /F 2>$null | Out-Null
+    }
+    catch {
+        # best-effort; nothing more we can do here
+    }
+}
+
+function Assert-BaselineReachable {
+    <#
+    Fail-closed guard for the known-buggy baseline negative control. A null
+    $Body means Get-WindowsRunBlock could not read $Ref at all (unreachable
+    history). The workflow already checks out with fetch-depth: 0, and this
+    candidate is a descendant of the baseline commit, so an unreachable
+    baseline is an environment/setup failure -- never a valid reason to
+    silently skip the negative control and still exit 0.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Ref,
+        [AllowNull()][string]$Body
+    )
+
+    if (-not $Body) {
+        throw "CSS-2302 regression harness: known-buggy baseline '$Ref' is unreachable in this checkout (Get-WindowsRunBlock returned no content). This candidate must remain a descendant of $Ref and the checkout must use fetch-depth: 0 (it already does in .github/workflows/test.yml). Treating this as fail-closed rather than silently skipping the negative control."
+    }
+}
 
 function Get-WindowsRunBlock {
     <#
@@ -152,8 +217,21 @@ function Invoke-RunBlock {
     Runs $ScriptBody (an extracted "Run tests (Windows)" body, verbatim) as
     a real child pwsh process, with $FakeBinDir prepended to PATH so the
     script's bare `task` invocations resolve to the fake native command, and
-    MATRIX_MODE forced to "windows-core". Returns the child's exit code plus
-    the fake task's call log.
+    MATRIX_MODE forced to "windows-core". Returns the child's exit code, its
+    fake task call log, whether it was killed for exceeding $TimeoutSeconds,
+    and paths to its captured stdout/stderr (always written, for evidence).
+
+    Uses System.Diagnostics.Process directly (not `&` / Start-Process) so:
+      - arguments are passed via ArgumentList (no manual quoting -- correct
+        even if $WorkDir/$scriptFile contain spaces).
+      - stdout/stderr are drained asynchronously via BeginOutputReadLine /
+        BeginErrorReadLine, which avoids the classic redirected-pipe
+        deadlock (a child that fills the OS pipe buffer while the parent is
+        blocked synchronously reading the other stream, or blocked in
+        WaitForExit before either stream is drained).
+      - WaitForExit(timeout-ms) bounds the wait; on timeout the full process
+        tree is force-killed (Stop-ProcessTree) and the cleanup wait itself
+        is bounded, so a wedged child can never hang the harness.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ScriptBody,
@@ -161,7 +239,8 @@ function Invoke-RunBlock {
         [Parameter(Mandatory = $true)][string]$FakeBinDir,
         [Parameter(Mandatory = $true)][string]$LogPath,
         [Parameter(Mandatory = $true)][int]$CoreExitCode,
-        [Parameter(Mandatory = $true)][int]$DocExitCode
+        [Parameter(Mandatory = $true)][int]$DocExitCode,
+        [int]$TimeoutSeconds = $ChildProcessTimeoutSeconds
     )
 
     if (Test-Path $LogPath) {
@@ -174,6 +253,9 @@ function Invoke-RunBlock {
     $testsDir = Join-Path $WorkDir "tests"
     New-Item -ItemType Directory -Path $testsDir -Force | Out-Null
 
+    $stdoutPath = Join-Path $WorkDir "candidate.stdout.log"
+    $stderrPath = Join-Path $WorkDir "candidate.stderr.log"
+
     $originalPath = $env:PATH
     $originalMode = $env:MATRIX_MODE
     $originalThreads = $env:MATRIX_TEST_THREADS
@@ -181,6 +263,14 @@ function Invoke-RunBlock {
     $originalDocExit = $env:FAKE_DOC_EXIT_CODE
     $originalLog = $env:FAKE_TASK_LOG
     $originalLocation = Get-Location
+
+    $proc = $null
+    $timedOut = $false
+    $exitCode = $null
+    $stdoutBuilder = New-Object System.Text.StringBuilder
+    $stderrBuilder = New-Object System.Text.StringBuilder
+    $outSubscription = $null
+    $errSubscription = $null
 
     try {
         $env:PATH = "$FakeBinDir;$originalPath"
@@ -191,10 +281,76 @@ function Invoke-RunBlock {
         $env:FAKE_TASK_LOG = $LogPath
 
         Set-Location $WorkDir
-        & pwsh -NoProfile -NonInteractive -File $scriptFile
-        $exitCode = $LASTEXITCODE
+
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = "pwsh"
+        foreach ($arg in @('-NoProfile', '-NonInteractive', '-File', $scriptFile)) {
+            $psi.ArgumentList.Add($arg)
+        }
+        $psi.WorkingDirectory = $WorkDir
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+
+        $proc = [System.Diagnostics.Process]::new()
+        $proc.StartInfo = $psi
+
+        $outSubscription = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -MessageData $stdoutBuilder -Action {
+            if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
+        } -PassThru
+        $errSubscription = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -MessageData $stderrBuilder -Action {
+            if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
+        } -PassThru
+
+        if (-not $proc.Start()) {
+            throw "Failed to start child pwsh process for $scriptFile (Process.Start returned false)"
+        }
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+
+        $exitedInTime = $proc.WaitForExit([Math]::Max(0, $TimeoutSeconds) * 1000)
+        $timedOut = -not $exitedInTime
+
+        if ($timedOut) {
+            Stop-ProcessTree -ProcessId $proc.Id
+            # Bounded cleanup wait: the tree is already being force-killed,
+            # this just gives the OS a moment to finish tearing it down so
+            # the redirected-stream handles can close cleanly. Never blocks
+            # indefinitely even if the kill itself is incomplete.
+            $null = $proc.WaitForExit(5000)
+        }
+        else {
+            # No-arg overload after the timed overload returns true is the
+            # documented way to ensure the async redirected-stream events
+            # have fully drained before we read $proc.ExitCode.
+            $proc.WaitForExit()
+            $exitCode = $proc.ExitCode
+        }
     }
     finally {
+        if ($null -ne $outSubscription) { Unregister-Event -SourceIdentifier $outSubscription.Name -ErrorAction SilentlyContinue }
+        if ($null -ne $errSubscription) { Unregister-Event -SourceIdentifier $errSubscription.Name -ErrorAction SilentlyContinue }
+        if ($null -ne $proc) { $proc.Dispose() }
+
+        Set-Content -Path $stdoutPath -Value $stdoutBuilder.ToString() -Encoding utf8
+        Set-Content -Path $stderrPath -Value $stderrBuilder.ToString() -Encoding utf8
+
+        # Redirecting the child's streams (needed to bound/kill it on timeout
+        # and avoid pipe deadlocks) means they are no longer inherited live
+        # by this process's console the way the original `&` invocation did.
+        # Echo the captured content now so the CI job log still shows exactly
+        # what the extracted candidate script printed -- evidence is not
+        # lost, just no longer interleaved in real time.
+        if ($stdoutBuilder.Length -gt 0) {
+            Write-Host "  [child stdout]"
+            Write-Host $stdoutBuilder.ToString().TrimEnd()
+        }
+        if ($stderrBuilder.Length -gt 0) {
+            Write-Host "  [child stderr]"
+            Write-Host $stderrBuilder.ToString().TrimEnd()
+        }
+
         Set-Location $originalLocation
         $env:PATH = $originalPath
         $env:MATRIX_MODE = $originalMode
@@ -210,8 +366,11 @@ function Invoke-RunBlock {
     }
 
     return [PSCustomObject]@{
-        ExitCode = $exitCode
-        Calls    = $callLog
+        ExitCode   = $exitCode
+        TimedOut   = $timedOut
+        Calls      = $callLog
+        StdOutPath = $stdoutPath
+        StdErrPath = $stderrPath
     }
 }
 
@@ -219,6 +378,7 @@ $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("css2302-winexit-" + [S
 New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
 
 try {
+  try {
     $fakeBinDir = Join-Path $tempRoot "bin"
     New-FakeTaskBin -Dir $fakeBinDir | Out-Null
     $logPath = Join-Path $tempRoot "task-calls.log"
@@ -228,6 +388,10 @@ try {
         throw "Could not read HEAD:${WorkflowRelativePath} -- is this running inside a git checkout?"
     }
     $baselineBody = Get-WindowsRunBlock -Ref $KnownBuggyBaselineRef
+    # Fail closed if the negative-control baseline is unreachable, rather
+    # than silently skipping it (see Assert-BaselineReachable). Caught by
+    # the outer catch below, which reports it and exits non-zero.
+    Assert-BaselineReachable -Ref $KnownBuggyBaselineRef -Body $baselineBody
 
     $failures = New-Object System.Collections.Generic.List[string]
 
@@ -248,17 +412,26 @@ try {
             -LogPath $logPath -CoreExitCode $CoreExitCode -DocExitCode $DocExitCode
 
         $ok = $true
-        if ($result.ExitCode -ne $ExpectedExitCode) {
-            $failures.Add("[$Name] expected exit code $ExpectedExitCode, got $($result.ExitCode)")
+        if ($result.TimedOut) {
+            # A timeout is never a valid stand-in for an expected core/doc
+            # exit code -- report it as its own failure mode instead of
+            # comparing $result.ExitCode (which is $null here).
+            $failures.Add("[$Name] child pwsh process timed out unexpectedly (harness bug or genuine hang) -- see $($result.StdOutPath) / $($result.StdErrPath)")
             $ok = $false
         }
-        if ($result.Calls.Count -ne $ExpectedCallCount) {
-            $failures.Add("[$Name] expected $ExpectedCallCount task invocation(s), observed $($result.Calls.Count): $($result.Calls -join ' | ')")
-            $ok = $false
-        }
-        if ($ExpectDocCallSkipped -and (@($result.Calls | Where-Object { $_ -match '--doc' })).Count -gt 0) {
-            $failures.Add("[$Name] doc-test task call should have been skipped after a core failure, but it ran")
-            $ok = $false
+        else {
+            if ($result.ExitCode -ne $ExpectedExitCode) {
+                $failures.Add("[$Name] expected exit code $ExpectedExitCode, got $($result.ExitCode)")
+                $ok = $false
+            }
+            if ($result.Calls.Count -ne $ExpectedCallCount) {
+                $failures.Add("[$Name] expected $ExpectedCallCount task invocation(s), observed $($result.Calls.Count): $($result.Calls -join ' | ')")
+                $ok = $false
+            }
+            if ($ExpectDocCallSkipped -and (@($result.Calls | Where-Object { $_ -match '--doc' })).Count -gt 0) {
+                $failures.Add("[$Name] doc-test task call should have been skipped after a core failure, but it ran")
+                $ok = $false
+            }
         }
 
         if ($ok) {
@@ -284,24 +457,66 @@ try {
         -ScriptBody $candidateBody -WorkDir $candidateWorkDir `
         -CoreExitCode 0 -DocExitCode 0 -ExpectedExitCode 0 -ExpectedCallCount 2
 
-    if (-not $baselineBody) {
-        Write-Host "Skipping known-buggy baseline check: $KnownBuggyBaselineRef is unreachable in this checkout's history."
+    # Baseline is confirmed reachable above (Assert-BaselineReachable did
+    # not throw) -- always run the negative control, never skip it.
+    $baselineWorkDir = Join-Path $tempRoot "baseline"
+    New-Item -ItemType Directory -Path $baselineWorkDir -Force | Out-Null
+
+    Write-Host "Running scenario: baseline ($KnownBuggyBaselineRef) reproduces the masking bug"
+    $baselineResult = Invoke-RunBlock -ScriptBody $baselineBody -WorkDir $baselineWorkDir -FakeBinDir $fakeBinDir `
+        -LogPath $logPath -CoreExitCode 17 -DocExitCode 0
+
+    if ($baselineResult.TimedOut) {
+        $failures.Add("[baseline] child pwsh process timed out unexpectedly while running the $KnownBuggyBaselineRef script body -- see $($baselineResult.StdOutPath) / $($baselineResult.StdErrPath)")
+        Write-Host "  FAIL"
+    }
+    elseif ($baselineResult.ExitCode -eq 0 -and $baselineResult.Calls.Count -eq 2) {
+        Write-Host "  PASS (negative control confirmed: the pre-fix script masks the core failure)"
     }
     else {
-        $baselineWorkDir = Join-Path $tempRoot "baseline"
-        New-Item -ItemType Directory -Path $baselineWorkDir -Force | Out-Null
+        $failures.Add("[baseline] expected the known-buggy $KnownBuggyBaselineRef script to mask a core failure (exit 0, 2 task calls), but got exit code $($baselineResult.ExitCode) with $($baselineResult.Calls.Count) call(s). This regression test's negative-control fixture may be stale.")
+        Write-Host "  FAIL"
+    }
 
-        Write-Host "Running scenario: baseline ($KnownBuggyBaselineRef) reproduces the masking bug"
-        $baselineResult = Invoke-RunBlock -ScriptBody $baselineBody -WorkDir $baselineWorkDir -FakeBinDir $fakeBinDir `
-            -LogPath $logPath -CoreExitCode 17 -DocExitCode 0
+    # --- Focused self-check: the fail-closed baseline guard actually fails
+    # closed (reviewer finding 1). Exercises Assert-BaselineReachable
+    # directly with a null body, independent of this checkout's real
+    # history, so the check is meaningful even though the real baseline
+    # above is reachable.
+    Write-Host "Running scenario: fail-closed guard throws when the baseline body is missing"
+    $missingBaselineThrew = $false
+    try {
+        Assert-BaselineReachable -Ref "0000000000000000000000000000000000000000" -Body $null
+    }
+    catch {
+        $missingBaselineThrew = $true
+    }
+    if (-not $missingBaselineThrew) {
+        $failures.Add("[fail-closed baseline guard] Assert-BaselineReachable did not throw for a null baseline body -- the negative control could silently be skipped again")
+        Write-Host "  FAIL"
+    }
+    else {
+        Write-Host "  PASS"
+    }
 
-        if ($baselineResult.ExitCode -eq 0 -and $baselineResult.Calls.Count -eq 2) {
-            Write-Host "  PASS (negative control confirmed: the pre-fix script masks the core failure)"
-        }
-        else {
-            $failures.Add("[baseline] expected the known-buggy $KnownBuggyBaselineRef script to mask a core failure (exit 0, 2 task calls), but got exit code $($baselineResult.ExitCode) with $($baselineResult.Calls.Count) call(s). This regression test's negative-control fixture may be stale.")
-            Write-Host "  FAIL"
-        }
+    # --- Focused self-check: a hanging child is detected, killed, and
+    # reported as its own failure mode (reviewer finding 2). Uses a short
+    # overridden timeout (2s) against a deliberately sleeping script body so
+    # this adds only ~2s to the run, not the full $ChildProcessTimeoutSeconds
+    # default, and leaves no sleeping process behind (Stop-ProcessTree kills
+    # the whole tree).
+    Write-Host "Running scenario: hanging child is detected, killed, and reported as a timeout"
+    $timeoutWorkDir = Join-Path $tempRoot "timeout-selfcheck"
+    New-Item -ItemType Directory -Path $timeoutWorkDir -Force | Out-Null
+    $hangingBody = "Start-Sleep -Seconds 60`nexit 0`n"
+    $timeoutResult = Invoke-RunBlock -ScriptBody $hangingBody -WorkDir $timeoutWorkDir -FakeBinDir $fakeBinDir `
+        -LogPath $logPath -CoreExitCode 0 -DocExitCode 0 -TimeoutSeconds 2
+    if (-not $timeoutResult.TimedOut) {
+        $failures.Add("[timeout self-check] expected the harness to detect and kill a hanging child within 2s, but TimedOut=$($timeoutResult.TimedOut) exitcode=$($timeoutResult.ExitCode)")
+        Write-Host "  FAIL"
+    }
+    else {
+        Write-Host "  PASS (hanging child was killed and reported as a timeout, not misread as a pass/fail)"
     }
 
     if ($failures.Count -gt 0) {
@@ -316,6 +531,13 @@ try {
     Write-Host ""
     Write-Host "CSS-2302 Windows exit-code propagation regression: all scenarios PASSED."
     exit 0
+  }
+  catch {
+    Write-Host ""
+    Write-Host "CSS-2302 Windows exit-code propagation regression FAILED with an unhandled error:"
+    Write-Host "  $($_.Exception.Message)"
+    exit 1
+  }
 }
 finally {
     Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
