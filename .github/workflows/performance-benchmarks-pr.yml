@@ -1,0 +1,93 @@
+# Fork-safe PR-only companion to performance-benchmarks.yml.
+#
+# performance-benchmarks.yml carries a `schedule:` trigger, which GitHub
+# Actions disables entirely (all triggers, not just `schedule`) on
+# repositories created as a fork — see `state: disabled_fork` on that
+# workflow. Re-enabling it here would also arm its nightly schedule, which
+# is out of scope for closing the PR-check gap and has not been separately
+# reviewed.
+#
+# This file mirrors only the `pr-smoke-nasty` job (same paths, script, and
+# pinned actions) from performance-benchmarks.yml so the PR smoke benchmark
+# runs on this fork without touching the inherited, schedule-bearing
+# workflow. Remove this file if/when performance-benchmarks.yml itself is
+# safely enabled.
+name: "Performance Benchmarks (PR)"
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Taskfile.yml'
+      - 'scripts/benchmarks/**'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/performance-benchmarks-pr.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-smoke-nasty:
+    name: PR Smoke Nasty Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Cache cargo
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-perf-smoke-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-perf-smoke-
+            ${{ runner.os }}-perf-
+
+      - name: Run reduced nasty benchmark gate
+        run: |
+          python3 scripts/benchmarks/git/benchmark_nasty_modes_vs_main.py \
+            --work-root .benchmarks/pr-smoke \
+            --feature-commits 24 \
+            --main-commits 10 \
+            --side-commits 8 \
+            --files 4 \
+            --lines-per-file 1000 \
+            --burst-every 6 \
+            --repetitions 2 \
+            --margin-pct 55 \
+            --margin-baseline main_daemon \
+            --enforce-margin
+
+      - name: Upload smoke benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr-smoke-nasty-benchmarks
+          path: .benchmarks/pr-smoke/artifacts/**
+          if-no-files-found: ignore
