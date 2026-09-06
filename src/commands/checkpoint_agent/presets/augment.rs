@@ -304,9 +304,10 @@ fn parse_v1(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
             metadata: HashMap::new(),
         };
 
-        // Mirror the codex/kimi-code style: explicit error on unknown events
-        // so we never fabricate spurious file-edit checkpoints when Augment
-        // fires SessionStart/SessionEnd/Stop.
+        // Explicit handling per event: PreToolUse/PostToolUse produce a
+        // checkpoint only for mutating tools; a genuinely unknown
+        // hook_event_name (typo/protocol drift) still fails loudly via the
+        // catch-all arm below.
         let event = match hook_event {
             Some("PreToolUse") => {
                 if is_bash {
@@ -323,10 +324,19 @@ fn parse_v1(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
                         tool_use_id: None,
                     })
                 } else {
-                    return Err(GitAiError::PresetError(format!(
-                        "Skipping Augment PreToolUse for unsupported tool {}",
-                        tool_name.unwrap_or("unknown")
-                    )));
+                    // Read-only/inspection tools (view, web-search, MCP
+                    // tools, etc.) and any other ToolClass::Skip tool are
+                    // an intentional no-op, not an error: the installer's
+                    // catch-all ".*" matcher fires this hook for every
+                    // tool call, so most invocations are non-mutating by
+                    // design. `git-ai checkpoint` exits 0 either way, and
+                    // Augment renders exit-0 stderr as a user-visible
+                    // warning, so returning PresetError here used to spam
+                    // a spurious "augment preset error" on ordinary,
+                    // successful non-edit tool use (CSS-2302,
+                    // discussion_r3942067001). Malformed/ambiguous input is
+                    // still caught above before we ever reach this point.
+                    return Ok(Vec::new());
                 }
             }
             Some("PostToolUse") => {
@@ -360,11 +370,19 @@ fn parse_v1(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
                         tool_use_id: None,
                     })
                 } else {
-                    return Err(GitAiError::PresetError(format!(
-                        "Skipping Augment PostToolUse for unsupported tool {}",
-                        tool_name.unwrap_or("unknown")
-                    )));
+                    // See the PreToolUse Skip arm above: intentional no-op.
+                    return Ok(Vec::new());
                 }
+            }
+            _ if hook_event.is_some_and(is_augment_v1_lifecycle_event) => {
+                // SessionStart/SessionEnd/Stop carry no tool/file
+                // information and are deliberately not checkpointed (see
+                // module docs). This is a separate, explicit allowlist
+                // from ToolClass::Skip above so that a genuinely
+                // unrecognized hook_event_name (a typo or protocol drift)
+                // still fails loudly instead of being silently absorbed by
+                // the same no-op policy (CSS-2302, discussion_r3942067001).
+                return Ok(Vec::new());
             }
             _ => {
                 return Err(GitAiError::PresetError(format!(
@@ -376,6 +394,14 @@ fn parse_v1(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
 
         Ok(vec![event])
     }
+}
+
+/// Augment v1 lifecycle events that carry no tool/file information and are
+/// deliberately not checkpointed. Kept as an explicit allowlist (rather than
+/// folding into the generic "unsupported event" catch-all) so a genuinely
+/// unknown/malformed `hook_event_name` still produces an actionable error.
+fn is_augment_v1_lifecycle_event(name: &str) -> bool {
+    matches!(name, "SessionStart" | "SessionEnd" | "Stop")
 }
 
 fn extract_post_file_paths(data: &serde_json::Value, workspace_root: &str) -> Vec<PathBuf> {
@@ -449,8 +475,9 @@ fn parse_v2(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
         metadata: HashMap::new(),
     };
 
-    // Same fail-closed policy as v1: explicit error on unknown/lifecycle
-    // events and unsupported tools, never a fabricated checkpoint.
+    // Explicit handling per hook_type: PreToolUse/PostToolUse produce a
+    // checkpoint only for mutating tools; a genuinely unknown hook_type
+    // (typo/protocol drift) still fails loudly via the catch-all arm below.
     let event = match hook_type {
         Some("PreToolUse") => {
             if is_bash {
@@ -475,10 +502,11 @@ fn parse_v2(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
                     tool_use_id: None,
                 })
             } else {
-                return Err(GitAiError::PresetError(format!(
-                    "Skipping Augment v2 PreToolUse for unsupported tool {}",
-                    tool_name.unwrap_or("unknown")
-                )));
+                // Intentional no-op, not an error: v2's `read` and any
+                // other ToolClass::Skip tool are read-only/non-mutating.
+                // See the identical v1 PreToolUse arm above for the full
+                // rationale (CSS-2302, discussion_r3942067001).
+                return Ok(Vec::new());
             }
         }
         Some("PostToolUse") => {
@@ -503,11 +531,17 @@ fn parse_v2(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
                     tool_use_id: None,
                 })
             } else {
-                return Err(GitAiError::PresetError(format!(
-                    "Skipping Augment v2 PostToolUse for unsupported tool {}",
-                    tool_name.unwrap_or("unknown")
-                )));
+                // See the PreToolUse Skip arm above: intentional no-op.
+                return Ok(Vec::new());
             }
+        }
+        _ if hook_type.is_some_and(is_augment_v2_lifecycle_event) => {
+            // SessionStart/SessionEnd/Stop/Notification/PromptSubmit carry
+            // no tool/file information and are deliberately not
+            // checkpointed (see module docs). Explicit allowlist, distinct
+            // from ToolClass::Skip above, so a genuinely unrecognized
+            // hook_type still fails loudly (CSS-2302, discussion_r3942067001).
+            return Ok(Vec::new());
         }
         _ => {
             return Err(GitAiError::PresetError(format!(
@@ -518,6 +552,18 @@ fn parse_v2(data: &serde_json::Value, trace_id: &str) -> Result<Vec<ParsedHookEv
     };
 
     Ok(vec![event])
+}
+
+/// Augment v2 lifecycle/notification hook types that carry no tool/file
+/// information and are deliberately not checkpointed. Kept as an explicit
+/// allowlist (rather than folding into the generic "unsupported hook_type"
+/// catch-all) so a genuinely unknown/malformed `hook_type` still produces an
+/// actionable error.
+fn is_augment_v2_lifecycle_event(name: &str) -> bool {
+    matches!(
+        name,
+        "SessionStart" | "SessionEnd" | "Stop" | "Notification" | "PromptSubmit"
+    )
 }
 
 #[cfg(test)]
@@ -750,36 +796,37 @@ mod tests {
     }
 
     #[test]
-    fn test_augment_unsupported_tool_pretooluse_errors() {
+    fn test_augment_unsupported_tool_pretooluse_skips_silently() {
         // Tools like view, grep-search, codebase-retrieval, web-fetch are
-        // documented but we don't checkpoint for them — verify they error
-        // rather than silently fabricating a checkpoint.
+        // documented but we don't checkpoint for them. The installer's
+        // catch-all ".*" matcher fires this hook for every tool call, so
+        // these are an intentional, silent no-op (empty Ok, not an error) --
+        // otherwise `git-ai checkpoint` would print a spurious "preset
+        // error" to stderr on ordinary, successful non-edit tool use, which
+        // Augment renders as a user-visible warning despite exit 0
+        // (CSS-2302, discussion_r3942067001).
         let input = make_hook_input("PreToolUse", "view", json!({"path": "src/foo.rs"}));
         let result = AugmentPreset.parse(&input, "t_test");
-        assert!(result.is_err());
-        match result {
-            Err(GitAiError::PresetError(msg)) => {
-                assert!(
-                    msg.contains("PreToolUse for unsupported tool"),
-                    "expected unsupported-tool message, got: {}",
-                    msg
-                );
-            }
-            _ => panic!("Expected PresetError"),
-        }
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
-    fn test_augment_unsupported_tool_posttooluse_errors() {
+    fn test_augment_unsupported_tool_posttooluse_skips_silently() {
         let input = make_hook_input("PostToolUse", "web-fetch", json!({"url": "https://x"}));
         let result = AugmentPreset.parse(&input, "t_test");
-        assert!(result.is_err());
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
-    fn test_augment_lifecycle_event_errors() {
-        // SessionStart / SessionEnd / Stop must not silently fall through
-        // to PostFileEdit.
+    fn test_augment_lifecycle_events_skip_silently() {
+        // SessionStart / SessionEnd / Stop carry no tool/file information
+        // and must not fall through to a fabricated PostFileEdit, but they
+        // are also not an error: they are documented, expected events that
+        // the catch-all-matcher-installed hook will legitimately receive,
+        // so silently no-op rather than printing an exit-0 "preset error"
+        // warning (CSS-2302, discussion_r3942067001). A genuinely unknown
+        // hook_event_name (see test_augment_missing_event_name_errors and
+        // the malformed/ambiguous-shape tests below) still errors.
         for event in ["SessionStart", "SessionEnd", "Stop"] {
             let input = json!({
                 "hook_event_name": event,
@@ -788,17 +835,10 @@ mod tests {
             })
             .to_string();
             let result = AugmentPreset.parse(&input, "t_test");
-            assert!(result.is_err(), "expected error for {event}");
-            match result {
-                Err(GitAiError::PresetError(msg)) => {
-                    assert!(
-                        msg.contains("Unsupported Augment hook_event_name"),
-                        "expected unknown-event message for {event}, got: {}",
-                        msg
-                    );
-                }
-                _ => panic!("Expected PresetError for {event}"),
-            }
+            assert!(
+                result.unwrap().is_empty(),
+                "expected silent no-op for {event}"
+            );
         }
     }
 
@@ -811,6 +851,31 @@ mod tests {
         .to_string();
         let result = AugmentPreset.parse(&input, "t_test");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_augment_unknown_hook_event_name_errors() {
+        // A genuinely unrecognized hook_event_name (typo/protocol drift)
+        // must still fail closed with an actionable error -- only the
+        // documented lifecycle events (see
+        // test_augment_lifecycle_events_skip_silently) are silently skipped.
+        let input = json!({
+            "hook_event_name": "TotallyUnknownEvent",
+            "conversation_id": "conv-1",
+            "workspace_roots": ["/Users/me/project"],
+        })
+        .to_string();
+        let result = AugmentPreset.parse(&input, "t_test");
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(
+                    msg.contains("Unsupported Augment hook_event_name"),
+                    "got: {}",
+                    msg
+                );
+            }
+            _ => panic!("Expected PresetError"),
+        }
     }
 
     #[test]
@@ -1014,32 +1079,26 @@ mod tests {
     }
 
     #[test]
-    fn test_augment_v2_read_tool_pretooluse_errors() {
+    fn test_augment_v2_read_tool_pretooluse_skips_silently() {
         // [live] real captured PreToolUse read payload -- read is
-        // intentionally not checkpointed (ToolClass::Skip).
+        // intentionally not checkpointed (ToolClass::Skip). The installer's
+        // catch-all ".*" matcher fires this hook for every tool call, so
+        // this must be a silent no-op, not a PresetError that `git-ai
+        // checkpoint` would print to stderr on an otherwise-successful
+        // exit 0 (Augment shows exit-0 stderr as a user warning) (CSS-2302,
+        // discussion_r3942067001).
         let input =
             r#"{"hook_type":"PreToolUse","tool_name":"read","tool_input":{"path":"foo.txt"}}"#;
         let result = AugmentPreset.parse(input, "t_test");
-        assert!(result.is_err());
-        match result {
-            Err(GitAiError::PresetError(msg)) => {
-                assert!(
-                    msg.contains("PreToolUse for unsupported tool"),
-                    "got: {}",
-                    msg
-                );
-            }
-            _ => panic!("Expected PresetError"),
-        }
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
-    fn test_augment_v2_read_tool_posttooluse_errors() {
+    fn test_augment_v2_read_tool_posttooluse_skips_silently() {
         // [live] real captured PostToolUse read payload.
-        let input = r#"{"hook_type":"PostToolUse","tool_name":"read","tool_input":{"path":"foo.txt"},"tool_result":[{"type":"text","text":"hello world
-"}],"tool_is_error":false}"#;
+        let input = r#"{"hook_type":"PostToolUse","tool_name":"read","tool_input":{"path":"foo.txt"},"tool_result":[{"type":"text","text":"hello world\n"}],"tool_is_error":false}"#;
         let result = AugmentPreset.parse(input, "t_test");
-        assert!(result.is_err());
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
@@ -1079,9 +1138,15 @@ mod tests {
     }
 
     #[test]
-    fn test_augment_v2_lifecycle_events_error() {
-        // [live] real captured minimal lifecycle payloads -- must not
-        // fall through to a fabricated checkpoint.
+    fn test_augment_v2_lifecycle_events_skip_silently() {
+        // [live] real captured minimal lifecycle payloads -- must not fall
+        // through to a fabricated checkpoint, but must also not surface as
+        // a PresetError: these are documented, expected hook_type values
+        // that the catch-all-matcher-installed hook will legitimately
+        // receive, so they silently no-op instead of printing an exit-0
+        // "preset error" warning (CSS-2302, discussion_r3942067001). A
+        // genuinely unknown hook_type (see
+        // test_augment_v2_unknown_hook_type_errors below) still errors.
         for payload in [
             r#"{"hook_type":"SessionStart"}"#,
             r#"{"hook_type":"SessionEnd"}"#,
@@ -1090,17 +1155,29 @@ mod tests {
             r#"{"hook_type":"PromptSubmit","user_prompt":"hello"}"#,
         ] {
             let result = AugmentPreset.parse(payload, "t_test");
-            assert!(result.is_err(), "expected error for {payload}, got Ok");
-            match result {
-                Err(GitAiError::PresetError(msg)) => {
-                    assert!(
-                        msg.contains("Unsupported Augment v2 hook_type"),
-                        "got: {}",
-                        msg
-                    );
-                }
-                _ => panic!("Expected PresetError"),
+            assert!(
+                result.unwrap().is_empty(),
+                "expected silent no-op for {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_augment_v2_unknown_hook_type_errors() {
+        // A genuinely unrecognized hook_type (typo/protocol drift) must
+        // still fail closed with an actionable error -- only the
+        // documented lifecycle events above are silently skipped.
+        let input = r#"{"hook_type":"TotallyUnknownHookType"}"#;
+        let result = AugmentPreset.parse(input, "t_test");
+        match result {
+            Err(GitAiError::PresetError(msg)) => {
+                assert!(
+                    msg.contains("Unsupported Augment v2 hook_type"),
+                    "got: {}",
+                    msg
+                );
             }
+            _ => panic!("Expected PresetError"),
         }
     }
 
@@ -1518,22 +1595,25 @@ mod tests {
     }
 
     #[test]
-    fn test_augment_v2_unknown_tool_name_pretooluse_errors_not_skipped_silently() {
-        // A v2 tool name outside the known write/edit/bash/read set must
-        // fail closed (PresetError), same as v1's unsupported-tool policy --
-        // never silently fabricate or silently drop the event.
+    fn test_augment_v2_unknown_tool_name_pretooluse_skips_silently() {
+        // Contract change (CSS-2302, discussion_r3942067001): this test
+        // previously asserted that any v2 tool name outside the known
+        // write/edit/bash/read set must fail closed with a PresetError. That
+        // policy is superseded: the installer's catch-all ".*" matcher fires
+        // this hook for EVERY tool call, including arbitrary/unenumerable
+        // MCP tool names (`{toolName}_{serverName}`, e.g. `search_my-server`)
+        // that git-ai has no way to classify in advance. Treating every
+        // ToolClass::Skip tool -- whether a documented read-only tool or a
+        // name we've simply never seen -- as a PresetError meant ordinary,
+        // successful MCP/tool use printed a spurious "augment preset error"
+        // to stderr on exit 0, which Augment renders as a user-visible
+        // warning. There is no reliable way to distinguish "malformed tool
+        // name" from "a real tool git-ai doesn't classify" at this layer, so
+        // both silently no-op; malformed JSON, ambiguous/wrong-typed
+        // discriminators, and unknown hook_type/hook_event_name values
+        // (see test_augment_v2_unknown_hook_type_errors) still fail closed.
         let input = r#"{"hook_type":"PreToolUse","tool_name":"totally-unknown-tool","tool_input":{"path":"x"}}"#;
         let result = AugmentPreset.parse(input, "t_test");
-        assert!(result.is_err());
-        match result {
-            Err(GitAiError::PresetError(msg)) => {
-                assert!(
-                    msg.contains("PreToolUse for unsupported tool"),
-                    "got: {}",
-                    msg
-                );
-            }
-            _ => panic!("Expected PresetError"),
-        }
+        assert!(result.unwrap().is_empty());
     }
 }

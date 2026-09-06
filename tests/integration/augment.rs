@@ -152,7 +152,12 @@ fn test_augment_routes_launch_process_to_bash() {
 }
 
 #[test]
-fn test_augment_rejects_lifecycle_events() {
+fn test_augment_skips_lifecycle_events_silently() {
+    // Lifecycle events carry no tool/file information and are deliberately
+    // not checkpointed, but they are not an error either: the installer's
+    // catch-all ".*" matcher fires this hook for every event Augment sends,
+    // so a documented lifecycle event is an expected, successful no-op
+    // (empty Ok), not a PresetError (CSS-2302, discussion_r3942067001).
     for event in ["SessionStart", "SessionEnd", "Stop"] {
         let payload = json!({
             "hook_event_name": event,
@@ -162,14 +167,21 @@ fn test_augment_rejects_lifecycle_events() {
         .to_string();
         let result = parse_augment(&payload);
         assert!(
-            result.is_err(),
-            "expected error for lifecycle event {event}, got Ok"
+            result.unwrap().is_empty(),
+            "expected silent no-op for lifecycle event {event}"
         );
     }
 }
 
 #[test]
-fn test_augment_rejects_unsupported_tools() {
+fn test_augment_skips_unsupported_tools_silently() {
+    // Read-only/inspection tools are documented but intentionally never
+    // checkpointed. Because the installer's catch-all ".*" matcher fires
+    // this hook for every tool call, these must silently no-op rather than
+    // surface as a PresetError -- otherwise `git-ai checkpoint` prints a
+    // spurious "augment preset error" to stderr on an otherwise-successful
+    // exit 0, which Augment renders as a user-visible warning for ordinary
+    // non-edit tool use (CSS-2302, discussion_r3942067001).
     for tool in [
         "view",
         "grep-search",
@@ -187,8 +199,8 @@ fn test_augment_rejects_unsupported_tools() {
         .to_string();
         let result = parse_augment(&payload);
         assert!(
-            result.is_err(),
-            "expected error for unsupported tool {tool}, got Ok"
+            result.unwrap().is_empty(),
+            "expected silent no-op for unsupported tool {tool}"
         );
     }
 }
@@ -464,7 +476,10 @@ fn test_augment_v2_routes_bash_to_bash_call() {
 }
 
 #[test]
-fn test_augment_v2_rejects_lifecycle_events() {
+fn test_augment_v2_skips_lifecycle_events_silently() {
+    // Same rationale as test_augment_skips_lifecycle_events_silently
+    // (v1): documented lifecycle hook_types are an expected, successful
+    // no-op, not a PresetError (CSS-2302, discussion_r3942067001).
     for hook_type in [
         "SessionStart",
         "SessionEnd",
@@ -475,17 +490,19 @@ fn test_augment_v2_rejects_lifecycle_events() {
         let payload = json!({"hook_type": hook_type}).to_string();
         let result = parse_augment(&payload);
         assert!(
-            result.is_err(),
-            "expected error for v2 lifecycle event {hook_type}, got Ok"
+            result.unwrap().is_empty(),
+            "expected silent no-op for v2 lifecycle event {hook_type}"
         );
     }
 }
 
 #[test]
-fn test_augment_v2_rejects_read_tool() {
+fn test_augment_v2_skips_read_tool_silently() {
     // `read` is v2's default toolset name for a non-mutating tool; it must
-    // not be checkpointed (ToolClass::Skip), same fail-closed policy as
-    // v1's unsupported-tool rejection.
+    // not be checkpointed (ToolClass::Skip), and -- since the installer's
+    // catch-all ".*" matcher fires this hook for every tool call -- that
+    // must be a silent no-op rather than a PresetError (CSS-2302,
+    // discussion_r3942067001).
     let payload = json!({
         "hook_type": "PreToolUse",
         "tool_name": "read",
@@ -493,7 +510,10 @@ fn test_augment_v2_rejects_read_tool() {
     })
     .to_string();
     let result = parse_augment(&payload);
-    assert!(result.is_err(), "expected error for read tool, got Ok");
+    assert!(
+        result.unwrap().is_empty(),
+        "expected silent no-op for read tool"
+    );
 }
 
 #[test]
@@ -686,4 +706,128 @@ fn test_augment_v2_e2e_edit_attribution() {
     ]);
 
     assert!(!commit.authorship_log.attestations.is_empty());
+}
+
+// ============================================================================
+// Handler-level stderr regression tests (CSS-2302, discussion_r3942067001)
+//
+// The installer wires the Augment hook under the catch-all ".*" matcher, so
+// `git-ai checkpoint augment` runs for every tool call, including tools the
+// preset deliberately never checkpoints (read-only tools, lifecycle events).
+// `handle_checkpoint` always exits 0 for a checkpoint invocation, but Augment
+// renders any exit-0 stderr as a user-visible warning -- so these assert the
+// real subprocess's combined stdout+stderr, not just the preset's Result
+// type, to guard against a future regression that reintroduces a printed
+// PresetError for an intentional no-op.
+// ============================================================================
+
+#[test]
+fn test_augment_handler_readonly_tool_exits_clean_with_empty_stderr() {
+    let repo = TestRepo::new();
+    let hook_input = json!({
+        "hook_event_name": "PreToolUse",
+        "conversation_id": "conv-handler-view",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "tool_name": "view",
+        "tool_input": {"path": "src/main.rs"},
+    })
+    .to_string();
+
+    let output = repo
+        .git_ai(&["checkpoint", "augment", "--hook-input", &hook_input])
+        .expect("git-ai checkpoint must exit 0 for an intentional read-only-tool skip");
+    assert!(
+        output.trim().is_empty(),
+        "expected empty stdout/stderr for an intentional read-only-tool skip, got: {output:?}"
+    );
+}
+
+#[test]
+fn test_augment_handler_lifecycle_event_exits_clean_with_empty_stderr() {
+    let repo = TestRepo::new();
+    let hook_input = json!({
+        "hook_event_name": "SessionStart",
+        "conversation_id": "conv-handler-lifecycle",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+    })
+    .to_string();
+
+    let output = repo
+        .git_ai(&["checkpoint", "augment", "--hook-input", &hook_input])
+        .expect("git-ai checkpoint must exit 0 for an intentional lifecycle-event skip");
+    assert!(
+        output.trim().is_empty(),
+        "expected empty stdout/stderr for an intentional lifecycle-event skip, got: {output:?}"
+    );
+}
+
+#[test]
+fn test_augment_v2_handler_read_tool_exits_clean_with_empty_stderr() {
+    let repo = TestRepo::new();
+    let hook_input = json!({
+        "hook_type": "PreToolUse",
+        "tool_name": "read",
+        "tool_input": {"path": "foo.txt"},
+    })
+    .to_string();
+
+    let output = repo
+        .git_ai(&["checkpoint", "augment", "--hook-input", &hook_input])
+        .expect("git-ai checkpoint must exit 0 for an intentional v2 read-tool skip");
+    assert!(
+        output.trim().is_empty(),
+        "expected empty stdout/stderr for an intentional v2 read-tool skip, got: {output:?}"
+    );
+}
+
+#[test]
+fn test_augment_handler_malformed_json_reports_actionable_stderr() {
+    let repo = TestRepo::new();
+
+    let output = repo
+        .git_ai(&["checkpoint", "augment", "--hook-input", "not valid json"])
+        .expect("git-ai checkpoint always exits 0, even on a preset error");
+    assert!(
+        output.contains("augment preset error") && output.contains("Invalid JSON in hook_input"),
+        "expected an actionable diagnostic for malformed JSON, got: {output:?}"
+    );
+}
+
+#[test]
+fn test_augment_handler_ambiguous_discriminator_reports_actionable_stderr() {
+    let repo = TestRepo::new();
+    let hook_input = json!({
+        "hook_event_name": "PostToolUse",
+        "hook_type": "PostToolUse",
+        "conversation_id": "conv-ambiguous",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+    })
+    .to_string();
+
+    let output = repo
+        .git_ai(&["checkpoint", "augment", "--hook-input", &hook_input])
+        .expect("git-ai checkpoint always exits 0, even on a preset error");
+    assert!(
+        output.contains("Ambiguous Augment hook_input"),
+        "expected an actionable diagnostic for an ambiguous discriminator, got: {output:?}"
+    );
+}
+
+#[test]
+fn test_augment_handler_wrong_type_discriminator_reports_actionable_stderr() {
+    let repo = TestRepo::new();
+    let hook_input = json!({
+        "hook_event_name": 123,
+        "conversation_id": "conv-wrong-type",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+    })
+    .to_string();
+
+    let output = repo
+        .git_ai(&["checkpoint", "augment", "--hook-input", &hook_input])
+        .expect("git-ai checkpoint always exits 0, even on a preset error");
+    assert!(
+        output.contains("hook_event_name must be a string"),
+        "expected an actionable diagnostic for a wrong-type discriminator, got: {output:?}"
+    );
 }
