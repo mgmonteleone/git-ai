@@ -1423,26 +1423,33 @@ mod tests {
         )
     }
 
+    // Deliberately `cmd.exe`, not `powershell.exe`: `cmd.exe` is a native,
+    // non-managed executable with process-creation latency comparable to
+    // Unix `sh` (no CLR/JIT warm-up), so it mirrors the Unix fixture's
+    // startup characteristics. `powershell.exe` cold-start (process
+    // creation + CLR init) was observed on CI to occasionally exceed even a
+    // multi-second budget under load (CSS-2302), causing the child to be
+    // killed before it ever wrote to stdout/stderr -- an empty-capture
+    // false failure, not the timeout/kill/partial-output behavior under
+    // test. `ping -n 61 127.0.0.1` (rather than a `timeout`-style command)
+    // is used to hang because `timeout`/`choice` refuse to run without a
+    // real console input handle, which isn't available when stdin isn't a
+    // console.
     #[cfg(windows)]
     fn stdout_stderr_sleep_command() -> (&'static str, Vec<&'static str>) {
         (
-            "powershell.exe",
-            vec![
-                "-NoProfile",
-                "-Command",
-                "[Console]::Out.Write('out'); [Console]::Error.Write('err'); Start-Sleep -Seconds 60",
-            ],
+            "cmd.exe",
+            vec!["/c", "echo out & echo err 1>&2 & ping -n 61 127.0.0.1 >nul"],
         )
     }
 
     /// Kill deadline for the partial-output timeout tests below.
     ///
-    /// On Windows, `powershell.exe` cold-start (process creation + CLR init)
-    /// on CI runners can itself exceed the tight 300ms budget that's plenty
-    /// on Unix for `sh`, causing the child to be killed before it ever
-    /// writes to stdout/stderr -- an empty-capture false failure, not the
-    /// timeout/kill/partial-output behavior under test. Give Windows a few
-    /// seconds of startup headroom while keeping the Unix budget tight.
+    /// Both fixtures use a lightweight, non-managed shell (`sh` / `cmd.exe`)
+    /// so process-creation latency is not expected to approach this budget
+    /// on either platform. Windows keeps a larger margin than Unix as
+    /// residual headroom for CI scheduler contention, without relying on
+    /// `powershell.exe`'s much higher and more variable cold-start cost.
     #[cfg(not(windows))]
     fn partial_output_timeout() -> Duration {
         Duration::from_millis(300)
