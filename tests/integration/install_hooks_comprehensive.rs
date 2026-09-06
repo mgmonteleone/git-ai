@@ -238,14 +238,13 @@ fn test_to_hashmap_all_statuses() {
 /// analyses at https://github.com/rust-lang/rust/issues/114554 and
 /// https://github.com/golang/go/issues/22315.
 ///
-/// Only a bare `raw_os_error() == 26` **on Linux** (ETXTBSY) is retried;
-/// raw OS error 26 means something else entirely on other platforms (e.g.
-/// on Windows it is `ERROR_NOT_READY`, unrelated to a busy executable), so
-/// this must never be treated as retryable off Linux. Every other error --
-/// including a successful spawn that later exits non-zero, and a raw 26 on
-/// a non-Linux OS -- is returned from the very first attempt, and after
-/// `attempts` consecutive Linux ETXTBSY failures the last error is returned
-/// instead of retrying forever.
+/// Only a bare `raw_os_error() == 26` **on Linux** (ETXTBSY) is retried.
+/// This workaround applies only on Linux; other platforms return spawn
+/// errors immediately by policy. Every other error -- including a
+/// successful spawn that later exits non-zero, and a raw 26 on a non-Linux
+/// OS -- is returned from the very first attempt, and after `attempts`
+/// consecutive Linux ETXTBSY failures the last error is returned instead of
+/// retrying forever.
 fn retry_on_etxtbsy<T>(
     attempts: usize,
     delay: std::time::Duration,
@@ -299,8 +298,8 @@ mod retry_on_etxtbsy_tests {
     }
 
     /// On Linux, raw OS error 26 is ETXTBSY and must be retried until the
-    /// operation succeeds. On every other platform, raw OS error 26 means
-    /// something unrelated (e.g. Windows `ERROR_NOT_READY`), so the very
+    /// operation succeeds. This workaround applies only on Linux; other
+    /// platforms return spawn errors immediately by policy, so the very
     /// first attempt's error must be returned immediately without retrying
     /// -- this branch is what catches a missing/removed platform guard on
     /// native macOS/Windows CI.
@@ -325,16 +324,16 @@ mod retry_on_etxtbsy_tests {
             assert_eq!(
                 calls.get(),
                 1,
-                "non-Linux must not retry raw OS error 26 (not ETXTBSY on this platform) and must fail on the first attempt"
+                "non-Linux errors are not retried by this policy and must fail on the first attempt"
             );
         }
     }
 
     /// On Linux, exhausting all attempts on a persistent ETXTBSY returns the
-    /// last error after `attempts` tries. On every other platform, raw OS
-    /// error 26 is not retryable at all, so exactly one attempt is made --
-    /// this is the exhaustion-side counterpart of the platform-guard check
-    /// above.
+    /// last error after `attempts` tries. This workaround applies only on
+    /// Linux; other platforms return spawn errors immediately by policy, so
+    /// exactly one attempt is made -- this is the exhaustion-side
+    /// counterpart of the platform-guard check above.
     #[test]
     fn returns_last_error_after_exhausting_attempts_only_on_linux() {
         let calls = Cell::new(0);
@@ -354,7 +353,7 @@ mod retry_on_etxtbsy_tests {
             assert_eq!(
                 calls.get(),
                 1,
-                "non-Linux must not retry raw OS error 26 (not ETXTBSY on this platform) and must fail on the first attempt"
+                "non-Linux errors are not retried by this policy and must fail on the first attempt"
             );
         }
     }
