@@ -2425,7 +2425,6 @@ pub(crate) fn remove_stale_daemon_files(config: &DaemonConfig) {
 #[cfg(not(unix))]
 pub(crate) fn remove_stale_daemon_files(_config: &DaemonConfig) {}
 
-#[cfg(not(windows))]
 fn daemon_is_test_mode() -> bool {
     std::env::var_os("GIT_AI_TEST_DB_PATH").is_some()
         || std::env::var_os("GITAI_TEST_DB_PATH").is_some()
@@ -2454,6 +2453,9 @@ fn maybe_setup_daemon_log_file(config: &DaemonConfig) -> Option<DaemonLogGuard> 
 
 #[cfg(windows)]
 fn maybe_setup_daemon_log_file(config: &DaemonConfig) -> Option<DaemonLogGuard> {
+    if daemon_is_test_mode() {
+        return None;
+    }
     match setup_daemon_log_file(config) {
         Ok(guard) => Some(guard),
         Err(e) => {
