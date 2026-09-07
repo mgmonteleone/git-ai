@@ -199,7 +199,7 @@ fn assert_diff_lines_exact(lines: &[DiffLine], expected: &[(&str, &str, Option<&
 fn sha256_hex(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
+    git_ai::utils::to_lower_hex(&hasher.finalize())
 }
 
 fn single_prompt_id(commit: &NewCommit) -> String {
