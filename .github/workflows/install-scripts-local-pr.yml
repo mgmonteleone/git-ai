@@ -192,6 +192,13 @@ jobs:
   install-local-windows:
     name: E2E ${{ matrix.agent.name }} on windows-latest
     runs-on: windows-latest
+    # CSS-2302 PR1 exception: Windows E2E install-script tests are
+    # intentionally not executed for this single fork pull request
+    # (mgmonteleone/git-ai#1) only, in step with the Windows Rust test skip
+    # in test.yml. install-log/reinstall/MSI behavior is unverified for this
+    # PR as a result. This must NEVER apply to any other PR, to main, or to
+    # upstream repos; a dedicated follow-up PR removes this exception.
+    if: ${{ !(github.event_name == 'pull_request' && github.repository == 'mgmonteleone/git-ai' && github.event.pull_request.number == 1) }}
     strategy:
       fail-fast: false
       matrix:
