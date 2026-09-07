@@ -1382,26 +1382,36 @@ mod tests {
         )
     }
 
+    // Deliberately `cmd.exe`, not `powershell.exe`; mirrors the fixture in
+    // `commands::debug::tests` (reviewed under CSS-2302), reproduced here
+    // rather than shared to avoid a cross-module test-only refactor. The
+    // hang is a single-process `for /L %i in (0,0,1) do @rem` busy-loop
+    // (step 0 never advances the counter, so it never exits on its own; a
+    // well-established cmd.exe idiom) instead of an external process like
+    // `ping`/`timeout`, so there is no descendant left to orphan when the
+    // tracked `cmd.exe` child is killed -- unlike an external command,
+    // which Windows always runs as a genuinely separate child process. This
+    // also sidesteps `powershell.exe`'s CLR cold-start latency, which is a
+    // plausible contributor to CI timeouts here but not a proven exclusive
+    // root cause. Trade-off: the busy-loop spins a CPU core instead of
+    // idling, for the short (~3s) window before the harness kills it.
     #[cfg(windows)]
     fn stdout_stderr_sleep_command() -> (&'static str, Vec<&'static str>) {
         (
-            "powershell.exe",
+            "cmd.exe",
             vec![
-                "-NoProfile",
-                "-Command",
-                "[Console]::Out.Write('out'); [Console]::Error.Write('err'); Start-Sleep -Seconds 60",
+                "/c",
+                "echo out & echo err 1>&2 & for /L %i in (0,0,1) do @rem",
             ],
         )
     }
 
     /// Kill deadline for the partial-output timeout test below.
     ///
-    /// On Windows, `powershell.exe` cold-start (process creation + CLR init)
-    /// on CI runners can itself exceed the tight 300ms budget that's plenty
-    /// on Unix for `sh`, causing the child to be killed before it ever
-    /// writes to stdout/stderr -- an empty-capture false failure, not the
-    /// timeout/kill/partial-output behavior under test. Give Windows a few
-    /// seconds of startup headroom while keeping the Unix budget tight.
+    /// Both fixtures use a lightweight, non-managed shell (`sh` / `cmd.exe`)
+    /// so process-creation latency is not expected to approach this budget
+    /// on either platform. Windows keeps a larger margin than Unix as
+    /// residual headroom for CI scheduler contention.
     #[cfg(not(windows))]
     fn partial_output_timeout() -> Duration {
         Duration::from_millis(300)
