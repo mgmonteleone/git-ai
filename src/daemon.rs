@@ -2430,16 +2430,36 @@ fn daemon_is_test_mode() -> bool {
         || std::env::var_os("GITAI_TEST_DB_PATH").is_some()
 }
 
+/// Narrow escape hatch for integration tests that need to verify genuine
+/// (non-test) daemon log-file creation while still running under the test
+/// harness's DB isolation (GIT_AI_TEST_DB_PATH/GITAI_TEST_DB_PATH). Setting
+/// this does NOT disable any other test-mode guard -- DB path, embedded-only
+/// pricing, and disabled bash-history recording all stay gated on
+/// `daemon_is_test_mode()` exactly as before. It only allows
+/// `maybe_setup_daemon_log_file` to proceed with the real stdout/stderr log
+/// redirect that is otherwise skipped in test mode.
+fn daemon_log_file_override_requested() -> bool {
+    std::env::var_os("GIT_AI_TEST_FORCE_DAEMON_LOG_FILE").is_some()
+}
+
+/// True when `maybe_setup_daemon_log_file` should skip the real log-file
+/// redirect: test mode is active and no override was requested.
+fn daemon_log_file_should_be_skipped() -> bool {
+    daemon_is_test_mode() && !daemon_log_file_override_requested()
+}
+
 fn daemon_log_dir(config: &DaemonConfig) -> PathBuf {
     config.internal_dir.join("daemon").join("logs")
 }
 
 /// Redirect stdout and stderr to a per-PID log file inside the daemon logs
-/// directory. Skipped in test mode to keep test output on the console.
+/// directory. Skipped in test mode to keep test output on the console, unless
+/// `daemon_log_file_override_requested()` explicitly asks for the real
+/// redirect (see its doc comment).
 /// Returns a guard that keeps the log file open for the lifetime of the daemon.
 #[cfg(unix)]
 fn maybe_setup_daemon_log_file(config: &DaemonConfig) -> Option<DaemonLogGuard> {
-    if daemon_is_test_mode() {
+    if daemon_log_file_should_be_skipped() {
         return None;
     }
     match setup_daemon_log_file(config) {
@@ -2453,7 +2473,7 @@ fn maybe_setup_daemon_log_file(config: &DaemonConfig) -> Option<DaemonLogGuard> 
 
 #[cfg(windows)]
 fn maybe_setup_daemon_log_file(config: &DaemonConfig) -> Option<DaemonLogGuard> {
-    if daemon_is_test_mode() {
+    if daemon_log_file_should_be_skipped() {
         return None;
     }
     match setup_daemon_log_file(config) {
@@ -11212,6 +11232,48 @@ mod tests {
         let _set_test = EnvVarGuard::set("GIT_AI_TEST_DB_PATH", "/tmp/git-ai-test.db");
 
         assert!(checkpoint_control_timeout_uses_ci_or_test_budget());
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_log_file_skipped_in_plain_test_mode() {
+        let _unset_force = EnvVarGuard::unset("GIT_AI_TEST_FORCE_DAEMON_LOG_FILE");
+        let _unset_legacy_test = EnvVarGuard::unset("GITAI_TEST_DB_PATH");
+        let _set_test = EnvVarGuard::set("GIT_AI_TEST_DB_PATH", "/tmp/git-ai-test.db");
+
+        assert!(
+            daemon_log_file_should_be_skipped(),
+            "log file redirect must stay suppressed so captured-stderr tests \
+             (e.g. the daemon memory-limit assertions) keep working"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_log_file_override_forces_real_redirect_in_test_mode() {
+        let _unset_legacy_test = EnvVarGuard::unset("GITAI_TEST_DB_PATH");
+        let _set_test = EnvVarGuard::set("GIT_AI_TEST_DB_PATH", "/tmp/git-ai-test.db");
+        let _set_force = EnvVarGuard::set("GIT_AI_TEST_FORCE_DAEMON_LOG_FILE", "1");
+
+        assert!(
+            !daemon_log_file_should_be_skipped(),
+            "GIT_AI_TEST_FORCE_DAEMON_LOG_FILE must let the real log-file \
+             redirect proceed even though DB-isolation test mode is active"
+        );
+        assert!(
+            daemon_is_test_mode(),
+            "the override must not disable DB isolation itself"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_log_file_not_skipped_outside_test_mode() {
+        let _unset_force = EnvVarGuard::unset("GIT_AI_TEST_FORCE_DAEMON_LOG_FILE");
+        let _unset_test = EnvVarGuard::unset("GIT_AI_TEST_DB_PATH");
+        let _unset_legacy_test = EnvVarGuard::unset("GITAI_TEST_DB_PATH");
+
+        assert!(!daemon_log_file_should_be_skipped());
     }
 
     #[test]
