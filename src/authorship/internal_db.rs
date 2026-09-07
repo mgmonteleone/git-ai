@@ -338,7 +338,7 @@ impl InternalDatabase {
         // Hash the canonicalized content
         let mut hasher = Sha256::new();
         hasher.update(canonical.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = crate::utils::to_lower_hex(&hasher.finalize());
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

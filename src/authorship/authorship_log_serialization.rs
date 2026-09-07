@@ -473,7 +473,7 @@ pub fn generate_short_hash(agent_id: &str, tool: &str) -> String {
     hasher.update(combined.as_bytes());
     let result = hasher.finalize();
     // Take first 16 characters of the hex representation
-    format!("{:x}", result)[..16].to_string()
+    crate::utils::to_lower_hex(&result)[..16].to_string()
 }
 
 /// Generate a short hash identifying a known human author from their git committer identity.
@@ -482,7 +482,7 @@ pub fn generate_short_hash(agent_id: &str, tool: &str) -> String {
 pub fn generate_human_short_hash(author_identity: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(author_identity.as_bytes());
-    let hex = format!("{:x}", hasher.finalize());
+    let hex = crate::utils::to_lower_hex(&hasher.finalize());
     format!("h_{}", &hex[..14])
 }
 
@@ -493,7 +493,7 @@ pub fn generate_session_id(agent_id: &str, tool: &str) -> String {
     let combined = format!("{}:{}", tool, agent_id);
     let mut hasher = Sha256::new();
     hasher.update(combined.as_bytes());
-    let hex = format!("{:x}", hasher.finalize());
+    let hex = crate::utils::to_lower_hex(&hasher.finalize());
     format!("s_{}", &hex[..14])
 }
 

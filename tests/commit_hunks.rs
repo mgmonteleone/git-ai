@@ -29,7 +29,7 @@ fn compute_content_hash(lines: &[&str]) -> String {
     let joined = lines.join("\n");
     let mut hasher = Sha256::new();
     hasher.update(joined.as_bytes());
-    format!("{:x}", hasher.finalize())
+    git_ai::utils::to_lower_hex(&hasher.finalize())
 }
 
 #[test]

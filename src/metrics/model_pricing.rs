@@ -374,7 +374,7 @@ fn catalog_with_id() -> &'static (PricingCatalog, String) {
 fn catalog_hash(models: &BTreeMap<String, ModelPricing>) -> String {
     use sha2::{Digest, Sha256};
     let json = serde_json::to_string(models).unwrap_or_default();
-    format!("{:x}", Sha256::digest(json.as_bytes()))[..12].to_string()
+    crate::utils::to_lower_hex(&Sha256::digest(json.as_bytes()))[..12].to_string()
 }
 
 fn embedded_catalog() -> PricingCatalog {

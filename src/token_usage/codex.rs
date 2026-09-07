@@ -699,7 +699,11 @@ fn entry_key(ts_ms: i64, model: &str, delta: &CodexTotals) -> String {
         delta.reasoning_output_tokens,
         delta.total_tokens
     );
-    format!("codex:{:x}", Sha256::digest(identity.as_bytes()))[..22].to_string()
+    format!(
+        "codex:{}",
+        crate::utils::to_lower_hex(&Sha256::digest(identity.as_bytes()))
+    )[..22]
+        .to_string()
 }
 
 #[derive(Deserialize)]

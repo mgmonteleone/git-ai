@@ -351,7 +351,7 @@ fn execute_resolved_checkpoint(
         combined_hasher.update(file_path.as_bytes());
         combined_hasher.update(hash.as_bytes());
     }
-    let combined_hash = format!("{:x}", combined_hasher.finalize());
+    let combined_hash = crate::utils::to_lower_hex(&combined_hasher.finalize());
     tracing::debug!(
         "[BENCHMARK] Hash computation took {:?}",
         hash_compute_start.elapsed()
@@ -570,7 +570,7 @@ fn save_current_file_states(
                     // Create SHA256 hash of the content
                     let mut hasher = Sha256::new();
                     hasher.update(content.as_bytes());
-                    let sha = format!("{:x}", hasher.finalize());
+                    let sha = crate::utils::to_lower_hex(&hasher.finalize());
 
                     // Ensure blobs directory exists
                     std::fs::create_dir_all(&*blobs_dir)?;

@@ -374,7 +374,7 @@ impl PersistedWorkingLog {
         // Create SHA256 hash of the content
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
-        let sha = format!("{:x}", hasher.finalize());
+        let sha = crate::utils::to_lower_hex(&hasher.finalize());
 
         // Ensure blobs directory exists
         let blobs_dir = self.dir.join("blobs");
