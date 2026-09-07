@@ -1424,22 +1424,45 @@ mod tests {
     }
 
     // Deliberately `cmd.exe`, not `powershell.exe`: `cmd.exe` is a native,
-    // non-managed executable with process-creation latency comparable to
-    // Unix `sh` (no CLR/JIT warm-up), so it mirrors the Unix fixture's
-    // startup characteristics. `powershell.exe` cold-start (process
-    // creation + CLR init) was observed on CI to occasionally exceed even a
-    // multi-second budget under load (CSS-2302), causing the child to be
-    // killed before it ever wrote to stdout/stderr -- an empty-capture
-    // false failure, not the timeout/kill/partial-output behavior under
-    // test. `ping -n 61 127.0.0.1` (rather than a `timeout`-style command)
-    // is used to hang because `timeout`/`choice` refuse to run without a
-    // real console input handle, which isn't available when stdin isn't a
-    // console.
+    // non-managed executable, so its process-creation latency is plausibly
+    // lower and less variable than the CLR-hosted `powershell.exe` (CSS-2302
+    // observed a CI timeout with empty captured buffers, consistent with --
+    // but not proof of -- the child being killed before it ever wrote to
+    // stdout/stderr; empty buffers alone don't rule out a reader/drain bug,
+    // so this is a plausible hypothesis, not a proven exclusive root cause).
+    //
+    // The hang is a single-process `for /L %i in (0,0,1) do @rem` busy-loop
+    // (step 0 never advances the counter, so the loop never terminates on
+    // its own; this is a well-established cmd.exe idiom for an unconditional
+    // wait -- see e.g. https://github.com/microsoft/terminal/issues/4379),
+    // NOT `ping -n 61 ...` or `timeout`/`choice`. Windows has no equivalent
+    // of Unix `exec` that lets `cmd.exe` replace its own process image with
+    // an external command: every external command (`ping.exe`, etc.) is a
+    // genuinely separate child process. `child.kill()` in process_timeout.rs
+    // only terminates the direct child (`cmd.exe`); it does not know about
+    // or terminate any descendants. A `ping`-based hang left `ping.exe`
+    // running as an orphaned descendant after `cmd.exe` was killed, and
+    // since it inherited the captured stdout/stderr pipe handles, its
+    // continued existence could keep those pipes open well past the
+    // intended timeout (CSS-2302 review finding) -- redirecting `ping`'s own
+    // stdout/stderr would not fix this, since the inherited handles are a
+    // separate concern from what `ping` itself writes to. Keeping the wait
+    // as a builtin loop inside `cmd.exe` itself means there is no descendant
+    // process at all, so killing `cmd.exe` immediately closes every handle
+    // it held, with nothing left to orphan.
+    //
+    // Trade-off: the busy-loop spins a CPU core (instead of `ping`/`sleep`'s
+    // ~0% idle wait) for the short window between spawn and being killed by
+    // the harness (bounded by `partial_output_timeout()` below, ~3s on
+    // Windows). This is judged acceptable for a short-lived test fixture.
     #[cfg(windows)]
     fn stdout_stderr_sleep_command() -> (&'static str, Vec<&'static str>) {
         (
             "cmd.exe",
-            vec!["/c", "echo out & echo err 1>&2 & ping -n 61 127.0.0.1 >nul"],
+            vec![
+                "/c",
+                "echo out & echo err 1>&2 & for /L %i in (0,0,1) do @rem",
+            ],
         )
     }
 
@@ -1601,6 +1624,17 @@ mod tests {
         );
         assert!(err.contains("stdout before timeout: out"), "{err}");
         assert!(err.contains("stderr before timeout: err"), "{err}");
+        // Regression guard (CSS-2302): a fixture that leaves a descendant
+        // process alive after the tracked child is killed (e.g. a `ping`-
+        // based hang spawned by `cmd.exe`) can hold the captured stdout/
+        // stderr pipes open past the kill, so process_timeout.rs's drain
+        // loop times out waiting for EOF and appends this diagnostic. Its
+        // absence confirms the fixture's hang has no surviving descendant
+        // holding the captured pipes open.
+        assert!(
+            !err.contains("output collection incomplete after timeout"),
+            "{err}"
+        );
     }
 
     #[test]
