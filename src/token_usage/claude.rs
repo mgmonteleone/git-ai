@@ -252,7 +252,7 @@ fn entry_key(
             let mut hasher = Sha256::new();
             hasher.update(line.as_bytes());
             hasher.update(key_salt.as_bytes());
-            format!("line:{:x}", hasher.finalize())[..21].to_string()
+            format!("line:{}", crate::utils::to_lower_hex(&hasher.finalize()))[..21].to_string()
         }
     }
 }

@@ -454,6 +454,21 @@ pub fn unix_timestamp_now() -> u64 {
         .as_secs()
 }
 
+/// Render bytes as lowercase hexadecimal, two digits per byte (leading
+/// zeros preserved), matching what `format!("{:x}", digest)` produced
+/// before `sha2`/`digest` 0.11 dropped `LowerHex` from digest output types
+/// (`hybrid_array::Array`). Dependency-free stdlib encoder so digest/hash
+/// formatting doesn't need to pull in the `hex` crate.
+pub fn to_lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        // Writing to a `String` via `core::fmt::Write` never fails.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// Read and deserialize a JSON file, returning None on any error (missing
 /// file, unreadable, or unparseable). For best-effort local caches.
 pub fn read_json_file<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
@@ -481,6 +496,51 @@ pub fn write_json_file<T: serde::Serialize>(path: &std::path::Path, value: &T) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // Hex encoding (sha2/digest 0.11 LowerHex compatibility, CSS-2302)
+    // =========================================================================
+
+    #[test]
+    fn test_to_lower_hex_empty() {
+        assert_eq!(to_lower_hex(&[]), "");
+    }
+
+    #[test]
+    fn test_to_lower_hex_preserves_leading_zeros_and_lowercase() {
+        assert_eq!(to_lower_hex(&[0x00, 0x0f, 0xab, 0xff]), "000fabff");
+    }
+
+    #[test]
+    fn test_to_lower_hex_matches_canonical_sha256_vectors() {
+        use sha2::{Digest, Sha256};
+
+        // NIST/FIPS 180 canonical SHA-256 test vectors, confirming the
+        // dependency-free encoder reproduces exactly what the pre-0.11
+        // `format!("{:x}", digest)` used to emit: full 64-char lowercase hex,
+        // no truncation, no case or padding drift.
+        let cases: &[(&[u8], &str)] = &[
+            (
+                b"",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                b"The quick brown fox jumps over the lazy dog",
+                "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let digest = Sha256::digest(input);
+            assert_eq!(&to_lower_hex(&digest), expected, "input={input:?}");
+            // Sanity: 32 bytes -> 64 hex chars, matching SHA-256's fixed length.
+            assert_eq!(to_lower_hex(&digest).len(), 64);
+        }
+    }
 
     // =========================================================================
     // JSON cache file helpers

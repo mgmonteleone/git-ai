@@ -317,7 +317,7 @@ fn releases_endpoint() -> &'static str {
 fn verify_sha256(content: &[u8], expected_hash: &str) -> Result<(), String> {
     let mut hasher = Sha256::new();
     hasher.update(content);
-    let actual_hash = format!("{:x}", hasher.finalize());
+    let actual_hash = crate::utils::to_lower_hex(&hasher.finalize());
 
     if actual_hash.eq_ignore_ascii_case(expected_hash) {
         Ok(())
@@ -1540,7 +1540,7 @@ mod tests {
         let content = b"\x00\x01\x02\x03\xff\xfe";
         let mut hasher = sha2::Sha256::new();
         hasher.update(content);
-        let expected = format!("{:x}", hasher.finalize());
+        let expected = crate::utils::to_lower_hex(&hasher.finalize());
         assert!(verify_sha256(content, &expected).is_ok());
     }
 
