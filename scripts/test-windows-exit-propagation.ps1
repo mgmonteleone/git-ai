@@ -17,9 +17,9 @@
     scenario.
 
     Scenarios exercised against the candidate (current HEAD) script:
-      1. core `task test` fails               -> exit code propagates, and
-                                                   the doc-test task is never
-                                                   invoked.
+      1. core `task test` fails               -> the doc-test task still
+                                                   runs, and the core's
+                                                   exit code propagates.
       2. core passes, doc-test `task test` fails -> exit code propagates.
       3. both succeed                          -> exit code 0.
 
