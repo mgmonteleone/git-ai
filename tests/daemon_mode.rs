@@ -8396,10 +8396,6 @@ fn trace_queue_full_drop_logs_the_dropped_root() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "CSS-2302: temporary quarantine, cause unconfirmed; re-enable after root cause fix + native Windows validation passes"
-)]
 fn await_waits_for_metrics_and_notes_flush() {
     let mut mock_api = MockApiServer::start();
 
@@ -8929,10 +8925,6 @@ fn token_usage_without_repo_url_passes_an_exclude_only_gate() {
 /// nothing crosses the wire. (The upload-time gate above is defense layer 2,
 /// for sessions tracked BEFORE a repo was excluded.)
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "CSS-2302: temporary quarantine, cause unconfirmed; re-enable after root cause fix + native Windows validation passes"
-)]
 fn excluded_repo_token_usage_never_uploads_via_the_real_pipeline() {
     let mut mock_api = MockApiServer::start();
     let metrics_db_path = std::env::temp_dir().join(format!(
