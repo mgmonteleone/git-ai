@@ -568,9 +568,9 @@ try {
     $candidateWorkDir = Join-Path $tempRoot "candidate"
     New-Item -ItemType Directory -Path $candidateWorkDir -Force | Out-Null
 
-    Test-Scenario -Name "candidate: core failure blocks doc-test and propagates exit code" `
+    Test-Scenario -Name "candidate: core failure still runs doc-test and propagates core's exit code" `
         -ScriptBody $candidateBody -WorkDir $candidateWorkDir `
-        -CoreExitCode 17 -DocExitCode 0 -ExpectedExitCode 17 -ExpectedCallCount 1 -ExpectDocCallSkipped
+        -CoreExitCode 17 -DocExitCode 0 -ExpectedExitCode 17 -ExpectedCallCount 2
 
     Test-Scenario -Name "candidate: doc-test failure propagates after core success" `
         -ScriptBody $candidateBody -WorkDir $candidateWorkDir `
