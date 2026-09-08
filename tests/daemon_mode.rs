@@ -218,7 +218,20 @@ impl MockApiServer {
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        handle_http_connection(stream, &tx);
+                        // Handle each connection on its own thread rather than
+                        // inline: the accept loop previously processed one
+                        // connection fully (including its own read timeout)
+                        // before accepting the next, so two genuinely
+                        // concurrent uploads (e.g. a periodic metrics flush
+                        // racing an awaited notes flush) serialized behind
+                        // each other. Under slower/contended schedulers
+                        // (observed on Windows CI runners) that head-of-line
+                        // blocking can push a second request's own read past
+                        // its timeout, producing a spurious upload failure
+                        // that then sits in the daemon's multi-minute retry
+                        // backoff (CSS-2302).
+                        let tx = tx.clone();
+                        thread::spawn(move || handle_http_connection(stream, &tx));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -388,6 +401,85 @@ fn write_http_response(stream: &mut TcpStream, body: &[u8]) {
         .write_all(body)
         .expect("failed to write mock API response body");
     stream.flush().expect("failed to flush mock API response");
+}
+
+/// Regression for the head-of-line blocking that used to live in
+/// `MockApiServer`'s accept loop (CSS-2302): each accepted connection was
+/// handled fully inline before the loop went back to `accept()`, so a slow
+/// sender (e.g. a client stalled by scheduler contention) delayed even an
+/// unrelated, already-connected client's response until the slow one's own
+/// 2s read timeout elapsed. That head-of-line delay is exactly the kind of
+/// transient failure window that pushes a metrics/notes upload into the
+/// daemon's multi-minute retry backoff, which `git-ai await` then correctly
+/// (and by design) reports as still-outstanding -- see
+/// `await_reports_backed_off_and_exhausted_metrics_as_outstanding`. Windows
+/// CI runners are more prone to exactly this kind of scheduling delay than
+/// Linux/macOS, which is consistent with the historically Windows-only
+/// failures on `await_waits_for_metrics_and_notes_flush`,
+/// `excluded_repo_token_usage_never_uploads_via_the_real_pipeline`, and
+/// `reingest_command_redelivers_bounded_and_all_metrics_through_daemon`.
+///
+/// This test fails on the pre-fix (inline, serial) `MockApiServer` because a
+/// fast, already-connected second client is forced to wait out the slow
+/// first client's full read timeout before it is even accepted.
+#[test]
+fn mock_api_server_does_not_head_of_line_block_concurrent_requests() {
+    let mut mock_api = MockApiServer::start();
+    let addr = mock_api
+        .base_url()
+        .trim_start_matches("http://")
+        .to_string();
+
+    // Slow client: connect immediately, but don't send any request bytes
+    // until well past the server's 2s per-connection read timeout.
+    let slow_addr = addr.clone();
+    let slow_client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(&slow_addr).expect("slow client connect failed");
+        thread::sleep(Duration::from_millis(2_500));
+        let _ = write_json_post(&mut stream, "/worker/metrics/upload", "{}");
+    });
+
+    // Give the slow client a head start so it is (deterministically) the
+    // first connection the accept loop observes.
+    thread::sleep(Duration::from_millis(200));
+
+    // Fast client: connects after the slow one and sends its request right
+    // away. It must not be blocked behind the slow client.
+    let fast_start = std::time::Instant::now();
+    let mut fast_stream = TcpStream::connect(&addr).expect("fast client connect failed");
+    let fast_response =
+        write_json_post(&mut fast_stream, "/worker/metrics/upload", "{}")
+            .expect("fast client should receive a response");
+    let fast_elapsed = fast_start.elapsed();
+
+    assert!(
+        fast_elapsed < Duration::from_millis(1_500),
+        "fast client waited {:?} for a response; a concurrent slow sender must not \
+         head-of-line block it (mock API accept loop is not per-connection)",
+        fast_elapsed
+    );
+    assert!(
+        fast_response.contains("errors"),
+        "expected the mock metrics-upload response, got: {fast_response}"
+    );
+
+    slow_client.join().expect("slow client thread panicked");
+}
+
+/// Send a minimal HTTP/1.1 POST and return the response body as a string.
+fn write_json_post(stream: &mut TcpStream, path: &str, body: &str) -> Option<String> {
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok();
+    Some(String::from_utf8_lossy(&response).into_owned())
 }
 
 fn configure_test_home_env(command: &mut Command, test_home: &Path) {
@@ -8304,9 +8396,6 @@ fn trace_queue_full_drop_logs_the_dropped_root() {
 }
 
 #[test]
-// CSS-2302: temporary Windows-only quarantine; the await/metrics-flush failure
-// cause on Windows CI is unconfirmed (not proven flaky). Re-enable once the
-// root cause is diagnosed/fixed and a native Windows run passes.
 #[cfg_attr(
     windows,
     ignore = "CSS-2302: temporary quarantine, cause unconfirmed; re-enable after root cause fix + native Windows validation passes"
@@ -8840,9 +8929,6 @@ fn token_usage_without_repo_url_passes_an_exclude_only_gate() {
 /// nothing crosses the wire. (The upload-time gate above is defense layer 2,
 /// for sessions tracked BEFORE a repo was excluded.)
 #[test]
-// CSS-2302: temporary Windows-only quarantine; the failure cause on Windows CI
-// is unconfirmed (not proven flaky). Re-enable once the root cause is
-// diagnosed/fixed and a native Windows run passes.
 #[cfg_attr(
     windows,
     ignore = "CSS-2302: temporary quarantine, cause unconfirmed; re-enable after root cause fix + native Windows validation passes"
