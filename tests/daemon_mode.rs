@@ -201,6 +201,7 @@ struct MockApiServer {
     stop: Arc<AtomicBool>,
     rx: mpsc::Receiver<Value>,
     thread: Option<thread::JoinHandle<()>>,
+    accepted_rx: mpsc::Receiver<()>,
 }
 
 impl MockApiServer {
@@ -211,6 +212,7 @@ impl MockApiServer {
             .expect("failed to set nonblocking listener");
         let addr = listener.local_addr().expect("failed to read listener addr");
         let (tx, rx) = mpsc::channel();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
 
@@ -230,6 +232,13 @@ impl MockApiServer {
                         // its timeout, producing a spurious upload failure
                         // that then sits in the daemon's multi-minute retry
                         // backoff (CSS-2302).
+                        //
+                        // Signal genuine acceptance (this listener actually
+                        // dequeued the connection) before spawning the
+                        // handler, so tests that need to prove a specific
+                        // slow-then-fast connection ordering can wait on a
+                        // real event instead of a fixed sleep heuristic.
+                        let _ = accepted_tx.send(());
                         let tx = tx.clone();
                         thread::spawn(move || handle_http_connection(stream, &tx));
                     }
@@ -246,11 +255,24 @@ impl MockApiServer {
             stop,
             rx,
             thread: Some(thread),
+            accepted_rx,
         }
     }
 
     fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Blocks until the accept loop has genuinely accepted (dequeued) a new
+    /// connection, or panics if none arrives within `timeout`. Unlike a
+    /// fixed sleep, this proves the server has actually observed that
+    /// specific connection -- e.g. to establish a deterministic slow-then-fast
+    /// ordering in a concurrency regression -- rather than merely hoping a
+    /// sleep duration was long enough (CSS-2302 review follow-up).
+    fn wait_for_next_accept(&self, timeout: Duration) {
+        self.accepted_rx
+            .recv_timeout(timeout)
+            .expect("mock API server did not accept a new connection within the timeout");
     }
 
     /// Collect all requests captured by the mock so far.
@@ -424,7 +446,7 @@ fn write_http_response(stream: &mut TcpStream, body: &[u8]) {
 /// first client's full read timeout before it is even accepted.
 #[test]
 fn mock_api_server_does_not_head_of_line_block_concurrent_requests() {
-    let mut mock_api = MockApiServer::start();
+    let mock_api = MockApiServer::start();
     let addr = mock_api
         .base_url()
         .trim_start_matches("http://")
@@ -439,17 +461,19 @@ fn mock_api_server_does_not_head_of_line_block_concurrent_requests() {
         let _ = write_json_post(&mut stream, "/worker/metrics/upload", "{}");
     });
 
-    // Give the slow client a head start so it is (deterministically) the
-    // first connection the accept loop observes.
-    thread::sleep(Duration::from_millis(200));
+    // Block until the mock server's accept loop has genuinely accepted the
+    // slow client's connection -- not a fixed sleep heuristic -- before the
+    // fast client even connects. Since the fast client has not connected
+    // yet, this accept event can only be the slow client's, deterministically
+    // establishing the slow-then-fast ordering the regression depends on.
+    mock_api.wait_for_next_accept(Duration::from_secs(2));
 
     // Fast client: connects after the slow one and sends its request right
     // away. It must not be blocked behind the slow client.
     let fast_start = std::time::Instant::now();
     let mut fast_stream = TcpStream::connect(&addr).expect("fast client connect failed");
-    let fast_response =
-        write_json_post(&mut fast_stream, "/worker/metrics/upload", "{}")
-            .expect("fast client should receive a response");
+    let fast_response = write_json_post(&mut fast_stream, "/worker/metrics/upload", "{}")
+        .expect("fast client should receive a response");
     let fast_elapsed = fast_start.elapsed();
 
     assert!(
@@ -474,9 +498,7 @@ fn write_json_post(stream: &mut TcpStream, path: &str, body: &str) -> Option<Str
         body
     );
     stream.write_all(request.as_bytes()).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response).ok();
     Some(String::from_utf8_lossy(&response).into_owned())
