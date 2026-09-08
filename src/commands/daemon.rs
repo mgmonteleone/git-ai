@@ -14,8 +14,6 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-#[cfg(windows)]
-use std::{ffi::OsStr, path::Path};
 
 pub fn handle_daemon(args: &[String]) {
     if args.is_empty() || is_help(args[0].as_str()) {
@@ -346,11 +344,6 @@ fn daemon_runtime_dir(config: &DaemonConfig) -> Result<PathBuf, String> {
         .ok_or_else(|| "daemon lock path has no parent".to_string())
 }
 
-#[cfg(windows)]
-fn powershell_single_quote_literal(value: &OsStr) -> String {
-    format!("'{}'", value.to_string_lossy().replace('\'', "''"))
-}
-
 #[cfg(any(windows, not(any(test, feature = "test-support"))))]
 fn spawn_daemon_run_detached(config: &DaemonConfig) -> Result<(), String> {
     // Use current_git_ai_exe() instead of current_exe() to resolve through
@@ -360,34 +353,44 @@ fn spawn_daemon_run_detached(config: &DaemonConfig) -> Result<(), String> {
     let exe = crate::utils::current_git_ai_exe().map_err(|e| e.to_string())?;
     let runtime_dir = daemon_runtime_dir(config)?;
 
+    let mut child = Command::new(exe);
+    child
+        .arg("bg")
+        .arg("run")
+        .current_dir(&runtime_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Remove git environment variables that must not leak into the daemon.
+    // The daemon is repository-agnostic; variables like GIT_DIR override
+    // the -C flag and cause repository resolution failures.
+    for var in crate::daemon::GIT_ENV_VARS_TO_SANITIZE {
+        child.env_remove(var);
+    }
+    // GIT_AI controls debug routing in the binary (GIT_AI=git → handle_git).
+    // A daemon that inherits this would route "bg run" to the git proxy instead
+    // of starting as a daemon.
+    child.env_remove("GIT_AI");
+
     #[cfg(windows)]
     {
-        let script = format!(
-            "Start-Process -FilePath {} -ArgumentList @('bg','run') -WorkingDirectory {} -WindowStyle Hidden",
-            powershell_single_quote_literal(exe.as_os_str()),
-            powershell_single_quote_literal(Path::new(&runtime_dir).as_os_str())
-        );
-        let mut child = Command::new("powershell.exe");
-        child
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-WindowStyle")
-            .arg("Hidden")
-            .arg("-Command")
-            .arg(script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        // Remove git environment variables that must not leak into the daemon.
-        for var in crate::daemon::GIT_ENV_VARS_TO_SANITIZE {
-            child.env_remove(var);
-        }
-        child.env_remove("GIT_AI");
-
+        // Spawn `git-ai bg run` directly rather than shelling out through
+        // `powershell.exe Start-Process`. PowerShell is CLR-hosted, so its
+        // process-creation latency is much higher and more variable than a
+        // native executable (see the `cmd.exe`-over-`powershell.exe` choice
+        // documented in src/commands/debug.rs and src/diagnostics.rs for the
+        // same CSS-2302 investigation). Under concurrent CI load that extra
+        // hop was enough to blow through the daemon-startup timeout, and any
+        // failure inside `Start-Process` itself was silently swallowed since
+        // only the wrapper `powershell.exe` process's own spawn was checked.
+        // `CREATE_BREAKAWAY_FROM_JOB` + `CREATE_NEW_PROCESS_GROUP` already
+        // gives the child the same detachment from the parent's job/console
+        // that `Start-Process` provided; `spawn_self_restart_process` below
+        // uses this same direct-spawn pattern for the daemon's own restart.
         let preferred_flags =
             CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
         child.creation_flags(preferred_flags);
-        match child.spawn() {
+        return match child.spawn() {
             Ok(_) => Ok(()),
             Err(preferred_err) => {
                 tracing::debug!(
@@ -402,29 +405,11 @@ fn spawn_daemon_run_detached(config: &DaemonConfig) -> Result<(), String> {
                     )
                 })
             }
-        }
+        };
     }
 
     #[cfg(not(windows))]
     {
-        let mut child = Command::new(exe);
-        child
-            .arg("bg")
-            .arg("run")
-            .current_dir(&runtime_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        // Remove git environment variables that must not leak into the daemon.
-        // The daemon is repository-agnostic; variables like GIT_DIR override
-        // the -C flag and cause repository resolution failures.
-        for var in crate::daemon::GIT_ENV_VARS_TO_SANITIZE {
-            child.env_remove(var);
-        }
-        // GIT_AI controls debug routing in the binary (GIT_AI=git → handle_git).
-        // A daemon that inherits this would route "bg run" to the git proxy instead
-        // of starting as a daemon.
-        child.env_remove("GIT_AI");
         child.spawn().map(|_| ()).map_err(|e| e.to_string())
     }
 }
