@@ -244,7 +244,20 @@ fn run_installed_git_wrapper(repo: &TestRepo, args: &[&str], timeout: Duration) 
     run_command_with_timeout(&mut command, timeout)
 }
 
-fn spawn_installed_daemon(repo: &TestRepo) -> Child {
+/// Spawns the installed daemon binary as a foreground child process.
+///
+/// `force_real_log_file` controls whether the daemon is asked to set up its
+/// genuine per-PID stdout/stderr log file despite running under the test
+/// harness's DB isolation markers (`configure_install_env` always sets
+/// GIT_AI_TEST_DB_PATH/GITAI_TEST_DB_PATH, which normally suppresses that
+/// redirect -- see `daemon_is_test_mode()` in src/daemon.rs). Passing `true`
+/// only bypasses the log-file suppression check; DB path, embedded-only
+/// pricing, and disabled bash-history recording all stay isolated to the
+/// test's fake HOME exactly as before. Callers that don't need to observe
+/// the real log file (e.g. the reinstall test) should pass `false` so the
+/// daemon's stderr/stdout keep going to the piped log files this function
+/// already sets up.
+fn spawn_installed_daemon(repo: &TestRepo, force_real_log_file: bool) -> Child {
     let stdout_log = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -264,6 +277,9 @@ fn spawn_installed_daemon(repo: &TestRepo) -> Child {
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log));
     configure_install_env(&mut command, repo);
+    if force_real_log_file {
+        command.env("GIT_AI_TEST_FORCE_DAEMON_LOG_FILE", "1");
+    }
     command.spawn().expect("failed to spawn installed daemon")
 }
 
@@ -343,7 +359,7 @@ fn windows_install_script_reinstall_stops_running_daemon() {
         installed_git_ai.display()
     );
 
-    let mut daemon = spawn_installed_daemon(&repo);
+    let mut daemon = spawn_installed_daemon(&repo, false);
     wait_for_child_to_stay_alive(&repo, &mut daemon, Duration::from_secs(2));
 
     let reinstall = run_install_script(&repo, Duration::from_secs(90));
@@ -380,7 +396,7 @@ fn windows_daemon_creates_log_file() {
         initial_install.stderr
     );
 
-    let mut daemon = spawn_installed_daemon(&repo);
+    let mut daemon = spawn_installed_daemon(&repo, true);
     wait_for_child_to_stay_alive(&repo, &mut daemon, Duration::from_secs(2));
 
     let log_path = wait_for_daemon_log_file(&repo, Duration::from_secs(15));

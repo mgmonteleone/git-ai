@@ -3,6 +3,8 @@
 use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
 use git_ai::authorship::stats::CommitStats;
 use git_ai::config::ConfigPatch;
+#[cfg(not(unix))]
+use git_ai::daemon::DaemonLock;
 use git_ai::daemon::{
     ControlRequest, DaemonClientStream, DaemonConfig, local_socket_connects_with_timeout,
     open_local_socket_stream_with_timeout, send_control_request, send_control_request_with_timeout,
@@ -47,6 +49,14 @@ use super::test_file::TestFile;
 
 const DAEMON_TEST_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 const DAEMON_TEST_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait, after a forceful Windows `taskkill`, for the daemon's
+/// exclusive `daemon.lock` handle to actually be released before giving up.
+/// `taskkill /F` only requests termination; it does not guarantee the OS has
+/// reclaimed the process's file handles by the time it returns (CSS-2302).
+#[cfg(not(unix))]
+const DAEMON_TEST_LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(unix))]
+const DAEMON_TEST_LOCK_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(windows)]
 const DAEMON_TEST_READY_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(not(windows))]
@@ -488,6 +498,30 @@ impl DaemonProcess {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .output();
+
+            // `taskkill /F` only requests termination; it does not guarantee the
+            // OS has released the exiting process's exclusive handles (e.g. the
+            // `daemon.lock` file, held via a share-mode-0 handle -- see
+            // `LockFile` in src/utils.rs) by the time it returns. A caller that
+            // immediately restarts a new daemon against the same test_home
+            // (`restart_dedicated_daemon_for_test`) can then race the still-
+            // exiting old process for that exact lock, surfacing as "git-ai
+            // background service is already running (lock held)" on Windows
+            // (CSS-2302). Poll until the lock is actually acquirable again --
+            // mirroring production's `wait_for_daemon_dead` in
+            // src/commands/daemon.rs -- before returning.
+            let lock_path = DaemonConfig::from_home(&self.daemon_home).lock_path;
+            let deadline = Instant::now() + DAEMON_TEST_LOCK_RELEASE_TIMEOUT;
+            loop {
+                if let Ok(lock) = DaemonLock::acquire(&lock_path) {
+                    drop(lock);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(DAEMON_TEST_LOCK_RELEASE_POLL_INTERVAL);
+            }
         }
     }
 }
@@ -1023,6 +1057,7 @@ fn is_known_checkpoint_preset(arg: &str) -> bool {
             | "gemini"
             | "github-copilot"
             | "amp"
+            | "augment"
             | "windsurf"
             | "opencode"
             | "pi"

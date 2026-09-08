@@ -1,0 +1,1168 @@
+//! Hook installer for Augment Code (Auggie CLI).
+//!
+//! Augment is a Node-based CLI from the Augment team. Hooks are configured
+//! in `~/.augment/settings.json` per the upstream docs at
+//! `https://docs.augmentcode.com/cli/config` and `https://docs.augmentcode.com/cli/hooks`.
+//! The schema mirrors Claude Code's:
+//!
+//! ```json
+//! {
+//!   "hooks": {
+//!     "PreToolUse": [
+//!       { "matcher": ".*",
+//!         "hooks": [ { "type": "command",
+//!                      "command": "/path/to/git-ai checkpoint augment --hook-input stdin" } ] } ] } }
+//! ```
+//!
+//! We install one entry under the `".*"` catch-all matcher for each of
+//! `PreToolUse` and `PostToolUse`. The `matcher` field accepts a regex
+//! per Augment's docs, with `".*"` as the documented "match everything"
+//! default. The preset itself filters tool events to the tools we
+//! actually checkpoint (`save-file`, `str-replace-editor`,
+//! `remove-files`, `launch-process`).
+//!
+//! The installer is idempotent: re-running it leaves the config
+//! unchanged when our entries are already present and current. Only
+//! entries we own (matched via `is_git_ai_augment_command`) are touched
+//! on uninstall, so user-defined hooks survive.
+
+use crate::error::GitAiError;
+use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
+use crate::mdm::utils::{
+    binary_exists, generate_diff, home_dir, is_git_ai_checkpoint_command,
+    normalize_windows_path_for_shell, write_atomic,
+};
+use serde_json::{Value, json};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const AUGMENT_CHECKPOINT_CMD: &str = "checkpoint augment --hook-input stdin";
+const AUGMENT_HOOK_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
+const AUGMENT_CATCH_ALL_MATCHER: &str = ".*";
+
+/// Executable names for every supported Augment Code CLI generation: v1
+/// (`auggie`) and v2 (`auggie-v2`, and its `cosmos-agent` kernel binary).
+/// `process_names` and tool-installed detection both derive from this list
+/// so they can never drift apart (CSS-2302).
+const AUGMENT_PROCESS_NAMES: [&str; 3] = ["auggie", "auggie-v2", "cosmos-agent"];
+
+/// Returns true if any supported Augment CLI executable name resolves via
+/// `exists`. Takes an injectable existence-check function so this name
+/// selection logic is unit-testable without mutating the real process PATH.
+fn any_supported_binary_exists(exists: impl Fn(&str) -> bool) -> bool {
+    AUGMENT_PROCESS_NAMES.iter().any(|name| exists(name))
+}
+
+/// Returns true only for git-ai hooks belonging to *this* preset
+/// (`git-ai checkpoint augment ...`). The shared
+/// `is_git_ai_checkpoint_command` helper matches any
+/// `git-ai checkpoint <preset>` line; we further verify the preset name
+/// is exactly `augment` (not a substring) by inspecting whitespace
+/// tokens.
+fn is_git_ai_augment_command(cmd: &str) -> bool {
+    if !is_git_ai_checkpoint_command(cmd) {
+        return false;
+    }
+    let mut tokens = cmd.split_whitespace();
+    while let Some(t) = tokens.next() {
+        if t == "checkpoint"
+            && let Some(name) = tokens.next()
+        {
+            return name == "augment";
+        }
+    }
+    false
+}
+
+pub struct AugmentInstaller;
+
+impl AugmentInstaller {
+    fn config_dir() -> PathBuf {
+        home_dir().join(".augment")
+    }
+
+    fn settings_path() -> PathBuf {
+        Self::config_dir().join("settings.json")
+    }
+
+    /// Quote a shell path if it contains characters that would otherwise
+    /// be split or reinterpreted by a POSIX-style shell (spaces, quotes,
+    /// backslashes, etc). Mirrors `GitHubCopilotInstaller::shell_quote_path`.
+    fn shell_quote_path(path: &str) -> String {
+        if path
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_./:=@".contains(character))
+        {
+            path.to_string()
+        } else {
+            format!("'{}'", path.replace('\'', "'\\''"))
+        }
+    }
+
+    fn desired_command(binary_path: &Path) -> String {
+        let normalized = normalize_windows_path_for_shell(binary_path);
+        let quoted = Self::shell_quote_path(&normalized);
+        format!("{quoted} {AUGMENT_CHECKPOINT_CMD}")
+    }
+
+    /// Returns `(hooks_installed, hooks_up_to_date)`.
+    /// `hooks_installed` = a git-ai-augment entry exists for at least one event.
+    /// `hooks_up_to_date` = an entry exists for every event we install,
+    ///                     in the catch-all matcher block.
+    fn hook_status(settings: &Value, desired_cmd: &str) -> (bool, bool) {
+        let Some(hooks_obj) = settings.get("hooks").and_then(|h| h.as_object()) else {
+            return (false, false);
+        };
+
+        let mut hooks_installed = false;
+        let mut up_to_date_events: Vec<&str> = Vec::new();
+
+        for event in &AUGMENT_HOOK_EVENTS {
+            let Some(blocks) = hooks_obj.get(*event).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for block in blocks {
+                let is_catch_all = block
+                    .get("matcher")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m == AUGMENT_CATCH_ALL_MATCHER)
+                    .unwrap_or(false);
+
+                let Some(inner) = block.get("hooks").and_then(|h| h.as_array()) else {
+                    continue;
+                };
+                for hook in inner {
+                    let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) else {
+                        continue;
+                    };
+                    if !is_git_ai_augment_command(cmd) {
+                        continue;
+                    }
+                    hooks_installed = true;
+                    if is_catch_all && cmd == desired_cmd && !up_to_date_events.contains(event) {
+                        up_to_date_events.push(event);
+                    }
+                }
+            }
+        }
+
+        let hooks_up_to_date = AUGMENT_HOOK_EVENTS
+            .iter()
+            .all(|e| up_to_date_events.contains(e));
+        (hooks_installed, hooks_up_to_date)
+    }
+
+    /// Core of `check_hooks`, with the binary-existence check and dotfile
+    /// presence injected as plain values rather than read from the real
+    /// process PATH / home directory. This keeps the fresh-v2-only-install
+    /// regression (and its siblings) fast, deterministic, and free of the
+    /// global-PATH-mutation races that binary-on-PATH integration tests
+    /// require (CSS-2302).
+    fn check_hooks_with(
+        binary_check: impl Fn(&str) -> bool,
+        has_dotfiles: bool,
+        settings_path: &Path,
+        params: &HookInstallerParams,
+    ) -> Result<HookCheckResult, GitAiError> {
+        let has_binary = any_supported_binary_exists(binary_check);
+
+        if !has_binary && !has_dotfiles {
+            return Ok(HookCheckResult {
+                tool_installed: false,
+                hooks_installed: false,
+                hooks_up_to_date: false,
+            });
+        }
+
+        if !settings_path.exists() {
+            return Ok(HookCheckResult {
+                tool_installed: true,
+                hooks_installed: false,
+                hooks_up_to_date: false,
+            });
+        }
+
+        let content = fs::read_to_string(settings_path)?;
+        let existing: Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
+        let desired_cmd = Self::desired_command(&params.binary_path);
+        let (hooks_installed, hooks_up_to_date) = Self::hook_status(&existing, &desired_cmd);
+
+        Ok(HookCheckResult {
+            tool_installed: true,
+            hooks_installed,
+            hooks_up_to_date,
+        })
+    }
+
+    fn install_hooks_at(
+        settings_path: &Path,
+        params: &HookInstallerParams,
+        dry_run: bool,
+    ) -> Result<Option<String>, GitAiError> {
+        // Do NOT create the parent directory here: this function must be a
+        // pure no-op filesystem-wise when `dry_run` is true. The real write
+        // path (`write_atomic`, below) already ensures the parent directory
+        // exists before it writes, so nothing is lost for the non-dry-run
+        // case.
+        let existing_content = if settings_path.exists() {
+            fs::read_to_string(settings_path)?
+        } else {
+            String::new()
+        };
+
+        let existing: Value = if existing_content.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&existing_content).map_err(|e| {
+                GitAiError::Generic(format!("Failed to parse Augment settings.json: {e}"))
+            })?
+        };
+
+        if !existing.is_object() {
+            return Err(GitAiError::Generic(
+                "Augment settings.json root must be a JSON object".to_string(),
+            ));
+        }
+
+        let desired_cmd = Self::desired_command(&params.binary_path);
+
+        let mut merged = existing.clone();
+        let mut hooks_obj = merged.get("hooks").cloned().unwrap_or_else(|| json!({}));
+        if !hooks_obj.is_object() {
+            return Err(GitAiError::Generic(
+                "Augment settings.json `hooks` field must be a JSON object".to_string(),
+            ));
+        }
+
+        for event in &AUGMENT_HOOK_EVENTS {
+            let mut event_array = hooks_obj
+                .get(*event)
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            // Step 1: Strip git-ai entries from non-catch-all matcher blocks
+            // (migration / cleanup of stale installs). Track empties.
+            let mut emptied_by_migration = vec![false; event_array.len()];
+            for (i, block) in event_array.iter_mut().enumerate() {
+                let is_catch_all = block
+                    .get("matcher")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m == AUGMENT_CATCH_ALL_MATCHER)
+                    .unwrap_or(false);
+                if !is_catch_all
+                    && let Some(hooks) = block.get_mut("hooks").and_then(|h| h.as_array_mut())
+                {
+                    let before = hooks.len();
+                    hooks.retain(|hook| {
+                        hook.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(|cmd| !is_git_ai_augment_command(cmd))
+                            .unwrap_or(true)
+                    });
+                    if hooks.is_empty() && before > 0 {
+                        emptied_by_migration[i] = true;
+                    }
+                }
+            }
+            let mut i = 0;
+            event_array.retain(|_| {
+                let drop = emptied_by_migration[i];
+                i += 1;
+                !drop
+            });
+
+            // Step 2: Find or create the catch-all matcher block.
+            let catch_all_idx = event_array
+                .iter()
+                .position(|b| {
+                    b.get("matcher")
+                        .and_then(|m| m.as_str())
+                        .map(|m| m == AUGMENT_CATCH_ALL_MATCHER)
+                        .unwrap_or(false)
+                })
+                .unwrap_or_else(|| {
+                    event_array.push(json!({
+                        "matcher": AUGMENT_CATCH_ALL_MATCHER,
+                        "hooks": []
+                    }));
+                    event_array.len() - 1
+                });
+
+            // Step 3: Ensure exactly one git-ai-augment command in the
+            // catch-all block.
+            let mut hooks_array = event_array[catch_all_idx]
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let mut found_idx: Option<usize> = None;
+            let mut needs_update = false;
+            for (idx, hook) in hooks_array.iter().enumerate() {
+                if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
+                    && is_git_ai_augment_command(cmd)
+                    && found_idx.is_none()
+                {
+                    found_idx = Some(idx);
+                    if cmd != desired_cmd {
+                        needs_update = true;
+                    }
+                }
+            }
+
+            match found_idx {
+                Some(idx) => {
+                    if needs_update {
+                        hooks_array[idx] = json!({
+                            "type": "command",
+                            "command": desired_cmd,
+                        });
+                    }
+                    let keep_idx = idx;
+                    let mut current = 0;
+                    hooks_array.retain(|hook| {
+                        if current == keep_idx {
+                            current += 1;
+                            true
+                        } else if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
+                            let dup = is_git_ai_augment_command(cmd);
+                            current += 1;
+                            !dup
+                        } else {
+                            current += 1;
+                            true
+                        }
+                    });
+                }
+                None => {
+                    hooks_array.push(json!({
+                        "type": "command",
+                        "command": desired_cmd,
+                    }));
+                }
+            }
+
+            if let Some(matcher_block) = event_array[catch_all_idx].as_object_mut() {
+                matcher_block.insert("hooks".to_string(), Value::Array(hooks_array));
+            }
+
+            if let Some(obj) = hooks_obj.as_object_mut() {
+                obj.insert(event.to_string(), Value::Array(event_array));
+            }
+        }
+
+        if let Some(root) = merged.as_object_mut() {
+            root.insert("hooks".to_string(), hooks_obj);
+        }
+
+        if existing == merged {
+            return Ok(None);
+        }
+
+        let new_content = serde_json::to_string_pretty(&merged)?;
+        let diff_output = generate_diff(settings_path, &existing_content, &new_content);
+
+        if !dry_run {
+            write_atomic(settings_path, new_content.as_bytes())?;
+        }
+
+        Ok(Some(diff_output))
+    }
+
+    fn uninstall_hooks_at(
+        settings_path: &Path,
+        dry_run: bool,
+    ) -> Result<Option<String>, GitAiError> {
+        if !settings_path.exists() {
+            return Ok(None);
+        }
+
+        let existing_content = fs::read_to_string(settings_path)?;
+        let existing: Value = match serde_json::from_str(&existing_content) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+
+        let mut merged = existing.clone();
+        let mut hooks_obj = match merged.get("hooks").cloned() {
+            Some(h) if h.is_object() => h,
+            _ => return Ok(None),
+        };
+
+        let mut changed = false;
+
+        for event in &AUGMENT_HOOK_EVENTS {
+            if let Some(event_array) = hooks_obj.get_mut(*event).and_then(|v| v.as_array_mut()) {
+                for matcher_block in event_array.iter_mut() {
+                    if let Some(hooks_array) = matcher_block
+                        .get_mut("hooks")
+                        .and_then(|h| h.as_array_mut())
+                    {
+                        let original = hooks_array.len();
+                        hooks_array.retain(|hook| {
+                            hook.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|cmd| !is_git_ai_augment_command(cmd))
+                                .unwrap_or(true)
+                        });
+                        if hooks_array.len() != original {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            return Ok(None);
+        }
+
+        if let Some(root) = merged.as_object_mut() {
+            root.insert("hooks".to_string(), hooks_obj);
+        }
+
+        let new_content = serde_json::to_string_pretty(&merged)?;
+        let diff_output = generate_diff(settings_path, &existing_content, &new_content);
+
+        if !dry_run {
+            write_atomic(settings_path, new_content.as_bytes())?;
+        }
+
+        Ok(Some(diff_output))
+    }
+}
+
+impl HookInstaller for AugmentInstaller {
+    fn name(&self) -> &str {
+        "Augment Code"
+    }
+
+    fn id(&self) -> &str {
+        "augment"
+    }
+
+    fn process_names(&self) -> Vec<&str> {
+        AUGMENT_PROCESS_NAMES.to_vec()
+    }
+
+    fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError> {
+        Self::check_hooks_with(
+            binary_exists,
+            Self::config_dir().exists(),
+            &Self::settings_path(),
+            params,
+        )
+    }
+
+    fn install_hooks(
+        &self,
+        params: &HookInstallerParams,
+        dry_run: bool,
+    ) -> Result<Option<String>, GitAiError> {
+        Self::install_hooks_at(&Self::settings_path(), params, dry_run)
+    }
+
+    fn uninstall_hooks(
+        &self,
+        _params: &HookInstallerParams,
+        dry_run: bool,
+    ) -> Result<Option<String>, GitAiError> {
+        Self::uninstall_hooks_at(&Self::settings_path(), dry_run)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn setup_test_env() -> (TempDir, PathBuf) {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join(".augment").join("settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        (td, path)
+    }
+
+    fn binary_path() -> PathBuf {
+        PathBuf::from("/usr/local/bin/git-ai")
+    }
+
+    fn params() -> HookInstallerParams {
+        HookInstallerParams {
+            binary_path: binary_path(),
+        }
+    }
+
+    fn expected_cmd() -> String {
+        format!("{} {}", binary_path().display(), AUGMENT_CHECKPOINT_CMD)
+    }
+
+    fn read_event_blocks(path: &Path, event: &str) -> Vec<Value> {
+        let content = fs::read_to_string(path).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        parsed
+            .get("hooks")
+            .and_then(|h| h.get(event))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn count_git_ai_entries(blocks: &[Value]) -> usize {
+        blocks
+            .iter()
+            .flat_map(|b| {
+                b.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(is_git_ai_augment_command)
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    // ---- is_git_ai_augment_command ----
+
+    #[test]
+    fn test_is_git_ai_augment_command_matches() {
+        assert!(is_git_ai_augment_command(
+            "/usr/local/bin/git-ai checkpoint augment --hook-input stdin"
+        ));
+        assert!(is_git_ai_augment_command(
+            "git-ai checkpoint augment --hook-input stdin"
+        ));
+    }
+
+    #[test]
+    fn test_is_git_ai_augment_command_does_not_match_siblings() {
+        // Must not match other git-ai presets.
+        assert!(!is_git_ai_augment_command(
+            "git-ai checkpoint claude --hook-input stdin"
+        ));
+        assert!(!is_git_ai_augment_command(
+            "git-ai checkpoint augment-pro --hook-input stdin"
+        ));
+        assert!(!is_git_ai_augment_command(
+            "git-ai checkpoint augment2 --hook-input stdin"
+        ));
+        assert!(!is_git_ai_augment_command("echo unrelated"));
+    }
+
+    // ---- Install scenarios ----
+
+    #[test]
+    fn s1_fresh_install_creates_pre_and_post() {
+        let (_td, path) = setup_test_env();
+        fs::remove_file(&path).ok();
+
+        let diff = AugmentInstaller::install_hooks_at(&path, &params(), false).unwrap();
+        assert!(diff.is_some(), "fresh install should produce a diff");
+
+        for event in &AUGMENT_HOOK_EVENTS {
+            let blocks = read_event_blocks(&path, event);
+            assert_eq!(blocks.len(), 1, "{event} should have one matcher block");
+            assert_eq!(
+                blocks[0].get("matcher").and_then(|m| m.as_str()).unwrap(),
+                AUGMENT_CATCH_ALL_MATCHER
+            );
+            let inner = blocks[0]
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(inner.len(), 1);
+            assert_eq!(
+                inner[0].get("command").and_then(|c| c.as_str()).unwrap(),
+                expected_cmd()
+            );
+            assert_eq!(
+                inner[0].get("type").and_then(|t| t.as_str()).unwrap(),
+                "command"
+            );
+        }
+    }
+
+    #[test]
+    fn s2_idempotent_already_installed() {
+        let (_td, path) = setup_test_env();
+        AugmentInstaller::install_hooks_at(&path, &params(), false).unwrap();
+        let diff2 = AugmentInstaller::install_hooks_at(&path, &params(), false).unwrap();
+        assert!(diff2.is_none(), "second install should be a no-op");
+    }
+
+    #[test]
+    fn s3_preserves_unrelated_hooks_and_other_settings() {
+        let (_td, path) = setup_test_env();
+        let unrelated = r#"{
+  "model": "claude-sonnet-4-5",
+  "permissions": { "allowList": [] },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "launch-process",
+        "hooks": [{"type": "command", "command": "echo unrelated"}] }
+    ]
+  }
+}"#;
+        fs::write(&path, unrelated).unwrap();
+
+        AugmentInstaller::install_hooks_at(&path, &params(), false).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        // Original settings preserved.
+        assert!(content.contains("\"model\""), "{content}");
+        assert!(content.contains("claude-sonnet-4-5"), "{content}");
+        assert!(content.contains("permissions"), "{content}");
+        assert!(content.contains("echo unrelated"), "{content}");
+        // Our entries added.
+        let pre_blocks = read_event_blocks(&path, "PreToolUse");
+        let total_git_ai = count_git_ai_entries(&pre_blocks);
+        assert_eq!(total_git_ai, 1, "exactly one git-ai entry under PreToolUse");
+    }
+
+    #[test]
+    fn s4_updates_outdated_command_path() {
+        let (_td, path) = setup_test_env();
+        let stale = r#"{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": ".*",
+        "hooks": [{"type": "command", "command": "/old/path/git-ai checkpoint augment --hook-input stdin"}] }
+    ],
+    "PostToolUse": [
+      { "matcher": ".*",
+        "hooks": [{"type": "command", "command": "/old/path/git-ai checkpoint augment --hook-input stdin"}] }
+    ]
+  }
+}"#;
+        fs::write(&path, stale).unwrap();
+
+        let diff = AugmentInstaller::install_hooks_at(&path, &params(), false).unwrap();
+        assert!(diff.is_some(), "stale path should produce a diff");
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("/usr/local/bin/git-ai"), "{content}");
+        assert!(!content.contains("/old/path/git-ai"), "{content}");
+
+        for event in &AUGMENT_HOOK_EVENTS {
+            assert_eq!(count_git_ai_entries(&read_event_blocks(&path, event)), 1);
+        }
+    }
+
+    #[test]
+    fn s5_dedups_existing_augment_entries_for_same_event() {
+        let (_td, path) = setup_test_env();
+        let cmd = expected_cmd();
+        let dup = format!(
+            r#"{{
+  "hooks": {{
+    "PreToolUse": [
+      {{ "matcher": ".*",
+        "hooks": [
+          {{"type": "command", "command": "{cmd}"}},
+          {{"type": "command", "command": "{cmd}"}}
+        ] }}
+    ]
+  }}
+}}"#
+        );
+        fs::write(&path, dup).unwrap();
+
+        AugmentInstaller::install_hooks_at(&path, &params(), false).unwrap();
+
+        let blocks = read_event_blocks(&path, "PreToolUse");
+        assert_eq!(count_git_ai_entries(&blocks), 1, "duplicates collapsed");
+    }
+
+    #[test]
+    fn s6_migrates_git_ai_from_non_catch_all_matcher() {
+        // A previous bad install or manual edit dropped our entry into a
+        // tool-specific matcher block. Install should migrate it to the
+        // catch-all and remove the now-empty tool-specific block.
+        let (_td, path) = setup_test_env();
+        let cmd = expected_cmd();
+        let migrate = format!(
+            r#"{{
+  "hooks": {{
+    "PreToolUse": [
+      {{ "matcher": "launch-process",
+        "hooks": [{{"type": "command", "command": "{cmd}"}}] }}
+    ]
+  }}
+}}"#
+        );
+        fs::write(&path, migrate).unwrap();
+
+        AugmentInstaller::install_hooks_at(&path, &params(), false).unwrap();
+
+        let blocks = read_event_blocks(&path, "PreToolUse");
+        // Now exactly one block (the catch-all), with our entry.
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].get("matcher").and_then(|m| m.as_str()).unwrap(),
+            AUGMENT_CATCH_ALL_MATCHER
+        );
+        assert_eq!(count_git_ai_entries(&blocks), 1);
+    }
+
+    #[test]
+    fn s7_dry_run_does_not_write() {
+        let (_td, path) = setup_test_env();
+        fs::remove_file(&path).ok();
+
+        let diff = AugmentInstaller::install_hooks_at(&path, &params(), true).unwrap();
+        assert!(diff.is_some(), "dry run still computes a diff");
+        assert!(!path.exists(), "dry run must not write the file");
+    }
+
+    #[test]
+    fn s9_dry_run_fresh_target_does_not_create_parent_dir() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join(".augment").join("settings.json");
+        assert!(!path.parent().unwrap().exists());
+
+        let diff = AugmentInstaller::install_hooks_at(&path, &params(), true).unwrap();
+        assert!(diff.is_some(), "dry run still computes a diff");
+        assert!(
+            !path.parent().unwrap().exists(),
+            "dry run must not create the parent directory"
+        );
+        assert!(!path.exists(), "dry run must not write the file");
+    }
+
+    #[test]
+    fn s10_dry_run_existing_settings_no_mutation() {
+        let (_td, path) = setup_test_env();
+        let initial = r#"{"hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": "echo not ours"}]}]}}"#;
+        fs::write(&path, initial).unwrap();
+
+        let diff = AugmentInstaller::install_hooks_at(&path, &params(), true).unwrap();
+        assert!(diff.is_some(), "dry run still computes a diff");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            initial,
+            "dry run must not modify existing settings bytes"
+        );
+        let tmp_path = path.with_extension("tmp");
+        assert!(
+            !tmp_path.exists(),
+            "dry run must not create backup/temp artifacts"
+        );
+    }
+
+    #[test]
+    fn s8_create_dir_on_first_install() {
+        let td = TempDir::new().unwrap();
+        let nested = td
+            .path()
+            .join("custom")
+            .join(".augment")
+            .join("settings.json");
+        assert!(!nested.parent().unwrap().exists());
+        AugmentInstaller::install_hooks_at(&nested, &params(), false).unwrap();
+        assert!(nested.exists());
+    }
+
+    // ---- Uninstall scenarios ----
+
+    #[test]
+    fn u1_uninstall_removes_only_augment_entries() {
+        let (_td, path) = setup_test_env();
+        let cmd = expected_cmd();
+        let mixed = format!(
+            r#"{{
+  "hooks": {{
+    "PreToolUse": [
+      {{ "matcher": ".*",
+        "hooks": [
+          {{"type": "command", "command": "{cmd}"}},
+          {{"type": "command", "command": "echo not ours"}}
+        ] }}
+    ]
+  }}
+}}"#
+        );
+        fs::write(&path, mixed).unwrap();
+
+        let diff = AugmentInstaller::uninstall_hooks_at(&path, false).unwrap();
+        assert!(diff.is_some());
+
+        let blocks = read_event_blocks(&path, "PreToolUse");
+        assert_eq!(count_git_ai_entries(&blocks), 0);
+        // User entry survived.
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("echo not ours"), "{content}");
+    }
+
+    #[test]
+    fn u2_uninstall_returns_none_when_no_augment_entries() {
+        let (_td, path) = setup_test_env();
+        fs::write(
+            &path,
+            r#"{"hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": "echo unrelated"}]}]}}"#,
+        )
+        .unwrap();
+        let diff = AugmentInstaller::uninstall_hooks_at(&path, false).unwrap();
+        assert!(diff.is_none());
+    }
+
+    #[test]
+    fn u3_uninstall_returns_none_when_settings_missing() {
+        let (_td, path) = setup_test_env();
+        fs::remove_file(&path).ok();
+        let diff = AugmentInstaller::uninstall_hooks_at(&path, false).unwrap();
+        assert!(diff.is_none());
+    }
+
+    #[test]
+    fn u4_dry_run_does_not_write() {
+        let (_td, path) = setup_test_env();
+        let cmd = expected_cmd();
+        let initial = format!(
+            r#"{{"hooks": {{"PreToolUse": [{{"matcher": ".*", "hooks": [{{"type": "command", "command": "{cmd}"}}]}}]}}}}"#
+        );
+        fs::write(&path, &initial).unwrap();
+
+        let diff = AugmentInstaller::uninstall_hooks_at(&path, true).unwrap();
+        assert!(diff.is_some());
+        // File contents unchanged.
+        assert_eq!(fs::read_to_string(&path).unwrap(), initial);
+    }
+
+    // ---- Error handling ----
+
+    #[test]
+    fn e1_invalid_json_install_errors() {
+        let (_td, path) = setup_test_env();
+        fs::write(&path, "{not valid json}").unwrap();
+        let result = AugmentInstaller::install_hooks_at(&path, &params(), false);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Failed to parse Augment settings.json"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn e2_invalid_json_uninstall_returns_none() {
+        let (_td, path) = setup_test_env();
+        fs::write(&path, "[not valid].").unwrap();
+        let diff = AugmentInstaller::uninstall_hooks_at(&path, false).unwrap();
+        assert!(diff.is_none());
+    }
+
+    #[test]
+    fn e3_root_must_be_object() {
+        let (_td, path) = setup_test_env();
+        fs::write(&path, "[]").unwrap();
+        let result = AugmentInstaller::install_hooks_at(&path, &params(), false);
+        assert!(result.is_err());
+    }
+
+    // ---- desired_command quoting / normalization ----
+
+    /// Minimal POSIX-shell word splitter, sufficient for asserting how a
+    /// real shell would tokenize the commands this installer produces
+    /// (bare tokens plus single-quoted segments with `'\''`-escaped
+    /// embedded quotes). Not a general-purpose shell parser.
+    fn split_shell_command(cmd: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        let mut in_word = false;
+        let mut chars = cmd.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                ' ' | '\t' => {
+                    if in_word {
+                        words.push(std::mem::take(&mut current));
+                        in_word = false;
+                    }
+                }
+                '\'' => {
+                    in_word = true;
+                    for c2 in chars.by_ref() {
+                        if c2 == '\'' {
+                            break;
+                        }
+                        current.push(c2);
+                    }
+                }
+                '\\' => {
+                    in_word = true;
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                _ => {
+                    in_word = true;
+                    current.push(c);
+                }
+            }
+        }
+        if in_word {
+            words.push(current);
+        }
+        words
+    }
+
+    #[test]
+    fn q1_unquoted_for_plain_path() {
+        // No special characters: no quoting needed, matches historical output.
+        let cmd = AugmentInstaller::desired_command(Path::new("/usr/local/bin/git-ai"));
+        assert_eq!(
+            cmd,
+            "/usr/local/bin/git-ai checkpoint augment --hook-input stdin"
+        );
+    }
+
+    #[test]
+    fn q2_quotes_path_with_spaces() {
+        let path = Path::new("/opt/My Apps/git-ai");
+        let cmd = AugmentInstaller::desired_command(path);
+        // The binary path must be a single shell token so the shell does not
+        // split it at the space and try to invoke a nonexistent `/opt/My`.
+        assert_eq!(
+            cmd,
+            "'/opt/My Apps/git-ai' checkpoint augment --hook-input stdin"
+        );
+        // Sanity-check argv splitting matches intent: exactly one path token.
+        let argv = split_shell_command(&cmd);
+        assert_eq!(argv[0], "/opt/My Apps/git-ai");
+        assert_eq!(argv[1], "checkpoint");
+        assert_eq!(argv[2], "augment");
+    }
+
+    #[test]
+    fn q3_escapes_embedded_single_quote() {
+        let path = Path::new("/opt/it's-mine/git-ai");
+        let cmd = AugmentInstaller::desired_command(path);
+        // POSIX single-quote escaping: close the quote, escape the quote
+        // char, reopen.
+        assert!(cmd.starts_with("'/opt/it'\\''s-mine/git-ai' "), "{cmd}");
+        let argv = split_shell_command(&cmd);
+        assert_eq!(argv[0], "/opt/it's-mine/git-ai");
+    }
+
+    #[test]
+    fn q4_normalizes_and_quotes_windows_path_with_spaces() {
+        // A realistic Windows install location with spaces and backslashes
+        // (the exact case from review comment discussion_r3942062953).
+        let path = Path::new(r"C:\Program Files\git-ai\git-ai.exe");
+        let cmd = AugmentInstaller::desired_command(path);
+        // Backslashes are converted to forward slashes (git bash / PowerShell
+        // convention shared with normalize_windows_path_for_shell), and the
+        // whole path is quoted because it contains a space.
+        assert_eq!(
+            cmd,
+            "'C:/Program Files/git-ai/git-ai.exe' checkpoint augment --hook-input stdin"
+        );
+        let argv = split_shell_command(&cmd);
+        assert_eq!(argv[0], "C:/Program Files/git-ai/git-ai.exe");
+    }
+
+    #[test]
+    fn q5_windows_path_without_spaces_still_normalized_unquoted() {
+        let path = Path::new(r"C:\Users\bob\.git-ai\git-ai.exe");
+        let cmd = AugmentInstaller::desired_command(path);
+        assert_eq!(
+            cmd,
+            "C:/Users/bob/.git-ai/git-ai.exe checkpoint augment --hook-input stdin"
+        );
+    }
+
+    #[test]
+    fn q6_recognizes_quoted_command_as_our_own() {
+        // is_git_ai_augment_command must still recognize the (now-quoted)
+        // desired command, so reinstall/upgrade over a path with spaces
+        // stays idempotent instead of re-inserting a duplicate entry.
+        let cmd = AugmentInstaller::desired_command(Path::new("/opt/My Apps/git-ai"));
+        assert!(is_git_ai_augment_command(&cmd));
+    }
+
+    #[test]
+    fn q7_install_and_reinstall_idempotent_for_spacey_path() {
+        // End-to-end: installing twice against a path containing a space
+        // must not corrupt settings.json or duplicate the entry.
+        let (_td, path) = setup_test_env();
+        let spacey_params = HookInstallerParams {
+            binary_path: PathBuf::from("/opt/My Apps/git-ai"),
+        };
+
+        let diff1 = AugmentInstaller::install_hooks_at(&path, &spacey_params, false).unwrap();
+        assert!(diff1.is_some());
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("'/opt/My Apps/git-ai' checkpoint augment"),
+            "{content}"
+        );
+
+        let diff2 = AugmentInstaller::install_hooks_at(&path, &spacey_params, false).unwrap();
+        assert!(
+            diff2.is_none(),
+            "reinstall over a spacey path must be a no-op"
+        );
+
+        for event in &AUGMENT_HOOK_EVENTS {
+            assert_eq!(count_git_ai_entries(&read_event_blocks(&path, event)), 1);
+        }
+    }
+
+    // ---- hook_status (check_hooks helper) ----
+
+    #[test]
+    fn check_status_reports_installed_when_present_in_catch_all() {
+        let cmd = expected_cmd();
+        let v: Value = serde_json::from_str(&format!(
+            r#"{{"hooks": {{
+                "PreToolUse": [{{"matcher": ".*", "hooks": [{{"type": "command", "command": "{cmd}"}}]}}],
+                "PostToolUse": [{{"matcher": ".*", "hooks": [{{"type": "command", "command": "{cmd}"}}]}}]
+            }}}}"#
+        ))
+        .unwrap();
+        let (installed, up_to_date) = AugmentInstaller::hook_status(&v, &cmd);
+        assert!(installed);
+        assert!(up_to_date);
+    }
+
+    #[test]
+    fn check_status_reports_outdated_when_only_one_event_present() {
+        let cmd = expected_cmd();
+        let v: Value = serde_json::from_str(&format!(
+            r#"{{"hooks": {{
+                "PreToolUse": [{{"matcher": ".*", "hooks": [{{"type": "command", "command": "{cmd}"}}]}}]
+            }}}}"#
+        ))
+        .unwrap();
+        let (installed, up_to_date) = AugmentInstaller::hook_status(&v, &cmd);
+        assert!(installed);
+        assert!(!up_to_date);
+    }
+
+    // ---- v2-only fresh install detection (CSS-2302) ----
+    //
+    // `any_supported_binary_exists` / `check_hooks_with` take an injected
+    // existence-check closure instead of touching the real process PATH,
+    // so these are plain, parallel-safe unit tests (no `#[serial]`, no
+    // env mutation).
+
+    #[test]
+    fn process_names_matches_supported_binary_detection() {
+        // Guards against the two lists drifting apart: whichever names
+        // `process_names` advertises are exactly the names the detector
+        // checks.
+        let installer = AugmentInstaller;
+        assert_eq!(installer.process_names(), AUGMENT_PROCESS_NAMES.to_vec());
+    }
+
+    #[test]
+    fn any_supported_binary_exists_true_for_v1_only() {
+        assert!(any_supported_binary_exists(|name| name == "auggie"));
+    }
+
+    #[test]
+    fn any_supported_binary_exists_true_for_auggie_v2_only() {
+        assert!(any_supported_binary_exists(|name| name == "auggie-v2"));
+    }
+
+    #[test]
+    fn any_supported_binary_exists_true_for_cosmos_agent_only() {
+        assert!(any_supported_binary_exists(|name| name == "cosmos-agent"));
+    }
+
+    #[test]
+    fn any_supported_binary_exists_false_when_none_present() {
+        assert!(!any_supported_binary_exists(|_| false));
+    }
+
+    #[test]
+    fn fresh_auggie_v2_only_install_is_tool_installed() {
+        // Regression for the reported bug: a fresh v2-only host has the
+        // `auggie-v2` executable on PATH but no v1 `auggie`, and no
+        // `~/.augment` settings directory yet (never configured before).
+        // Before the fix this fell through both branches of the
+        // `!has_binary && !has_dotfiles` check and reported `NotFound`,
+        // which made the install runner skip writing hooks entirely.
+        let (_td, settings_path) = setup_test_env();
+        let missing_settings_path = settings_path.parent().unwrap().join("nonexistent.json");
+        let result = AugmentInstaller::check_hooks_with(
+            |name| name == "auggie-v2",
+            /* has_dotfiles */ false,
+            &missing_settings_path,
+            &params(),
+        )
+        .unwrap();
+        assert!(
+            result.tool_installed,
+            "fresh auggie-v2-only install must be detected as tool_installed"
+        );
+        assert!(!result.hooks_installed);
+    }
+
+    #[test]
+    fn fresh_cosmos_agent_only_install_is_tool_installed() {
+        let (_td, settings_path) = setup_test_env();
+        let missing_settings_path = settings_path.parent().unwrap().join("nonexistent.json");
+        let result = AugmentInstaller::check_hooks_with(
+            |name| name == "cosmos-agent",
+            false,
+            &missing_settings_path,
+            &params(),
+        )
+        .unwrap();
+        assert!(
+            result.tool_installed,
+            "fresh cosmos-agent-only install must be detected as tool_installed"
+        );
+    }
+
+    #[test]
+    fn fresh_v1_only_install_is_still_tool_installed() {
+        // Retain existing v1 detection behavior.
+        let (_td, settings_path) = setup_test_env();
+        let missing_settings_path = settings_path.parent().unwrap().join("nonexistent.json");
+        let result = AugmentInstaller::check_hooks_with(
+            |name| name == "auggie",
+            false,
+            &missing_settings_path,
+            &params(),
+        )
+        .unwrap();
+        assert!(result.tool_installed);
+    }
+
+    #[test]
+    fn dotfile_fallback_detected_with_no_binary_on_path() {
+        // Retain existing dotfile-fallback behavior: no supported binary
+        // resolves, but `~/.augment` already exists (e.g. prior install).
+        let (_td, settings_path) = setup_test_env();
+        let result = AugmentInstaller::check_hooks_with(
+            |_| false,
+            /* has_dotfiles */ true,
+            &settings_path, // settings.json itself doesn't exist yet
+            &params(),
+        )
+        .unwrap();
+        assert!(result.tool_installed);
+        assert!(!result.hooks_installed);
+    }
+
+    #[test]
+    fn no_binary_and_no_dotfiles_is_not_installed() {
+        let (_td, settings_path) = setup_test_env();
+        let missing_settings_path = settings_path.parent().unwrap().join("nonexistent.json");
+        let result =
+            AugmentInstaller::check_hooks_with(|_| false, false, &missing_settings_path, &params())
+                .unwrap();
+        assert!(!result.tool_installed);
+        assert!(!result.hooks_installed);
+        assert!(!result.hooks_up_to_date);
+    }
+}

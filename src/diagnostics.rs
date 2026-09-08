@@ -1382,16 +1382,44 @@ mod tests {
         )
     }
 
+    // Deliberately `cmd.exe`, not `powershell.exe`; mirrors the fixture in
+    // `commands::debug::tests` (reviewed under CSS-2302), reproduced here
+    // rather than shared to avoid a cross-module test-only refactor. The
+    // hang is a single-process `for /L %i in (0,0,1) do @rem` busy-loop
+    // (step 0 never advances the counter, so it never exits on its own; a
+    // well-established cmd.exe idiom) instead of an external process like
+    // `ping`/`timeout`, so there is no descendant left to orphan when the
+    // tracked `cmd.exe` child is killed -- unlike an external command,
+    // which Windows always runs as a genuinely separate child process. This
+    // also sidesteps `powershell.exe`'s CLR cold-start latency, which is a
+    // plausible contributor to CI timeouts here but not a proven exclusive
+    // root cause. Trade-off: the busy-loop spins a CPU core instead of
+    // idling, for the short (~3s) window before the harness kills it.
     #[cfg(windows)]
     fn stdout_stderr_sleep_command() -> (&'static str, Vec<&'static str>) {
         (
-            "powershell.exe",
+            "cmd.exe",
             vec![
-                "-NoProfile",
-                "-Command",
-                "[Console]::Out.Write('out'); [Console]::Error.Write('err'); Start-Sleep -Seconds 60",
+                "/c",
+                "echo out & echo err 1>&2 & for /L %i in (0,0,1) do @rem",
             ],
         )
+    }
+
+    /// Kill deadline for the partial-output timeout test below.
+    ///
+    /// Both fixtures use a lightweight, non-managed shell (`sh` / `cmd.exe`)
+    /// so process-creation latency is not expected to approach this budget
+    /// on either platform. Windows keeps a larger margin than Unix as
+    /// residual headroom for CI scheduler contention.
+    #[cfg(not(windows))]
+    fn partial_output_timeout() -> Duration {
+        Duration::from_millis(300)
+    }
+
+    #[cfg(windows)]
+    fn partial_output_timeout() -> Duration {
+        Duration::from_secs(3)
     }
 
     #[test]
@@ -1456,7 +1484,7 @@ mod tests {
     fn test_run_logged_command_with_timeout_reports_partial_output() {
         let (program, args) = stdout_stderr_sleep_command();
         let record =
-            run_logged_command_with_timeout(program, &args, None, Duration::from_millis(300));
+            run_logged_command_with_timeout(program, &args, None, partial_output_timeout());
 
         assert!(record.timed_out, "{record:?}");
         assert_eq!(record.stdout, "out");

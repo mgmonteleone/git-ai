@@ -934,12 +934,20 @@ fn count_pending_metrics_for_await() -> usize {
         return 0;
     }
 
+    // `await` must report every not-yet-delivered row, not just rows the
+    // background flusher could immediately retry: a row that just failed
+    // an upload attempt (e.g. a transient network error) gets its
+    // `next_retry_at` pushed minutes into the future and drops out of
+    // `count_retryable`, even though it was never delivered. `count` has
+    // no such backoff filter, so use it here instead of `count_retryable`
+    // -- otherwise an awaited flush could certify "done" while a failed
+    // upload sat silently deferred for its backoff window.
     MetricsDatabase::global()
         .and_then(|db| {
             db.lock()
                 .map_err(|_| GitAiError::Generic("metrics DB lock poisoned".to_string()))
         })
-        .and_then(|db| db.count_retryable())
+        .and_then(|db| db.count())
         .unwrap_or(0)
 }
 

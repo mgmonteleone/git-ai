@@ -371,6 +371,19 @@ pub fn classify_tool(agent: Agent, tool_name: &str) -> ToolClass {
             "run_command" => ToolClass::Bash,
             _ => ToolClass::Skip,
         },
+        Agent::Augment => match tool_name {
+            // v1 tool names: kebab-case, Augment-specific.
+            "save-file" | "str-replace-editor" | "remove-files" | "apply_patch" => {
+                ToolClass::FileEdit
+            }
+            "launch-process" => ToolClass::Bash,
+            // v2 tool names: lowercase, Claude-Code-shaped default
+            // toolset (CSS-2302). "read" falls through to Skip since
+            // reads are not checkpointed. No collisions with v1 names.
+            "write" | "edit" => ToolClass::FileEdit,
+            "bash" => ToolClass::Bash,
+            _ => ToolClass::Skip,
+        },
         Agent::Cursor => match tool_name {
             "Write" | "Delete" | "StrReplace" | "ApplyPatch" => ToolClass::FileEdit,
             "Shell" => ToolClass::Bash,
@@ -405,6 +418,7 @@ pub enum Agent {
     Windsurf,
     Cursor,
     Cline,
+    Augment,
 }
 
 // ---------------------------------------------------------------------------
@@ -1553,6 +1567,45 @@ mod tests {
         );
         assert_eq!(classify_tool(Agent::Cursor, "Shell"), ToolClass::Bash);
         assert_eq!(classify_tool(Agent::Cursor, "Read"), ToolClass::Skip);
+
+        // Augment Code (kebab-case lowercase tool names)
+        assert_eq!(
+            classify_tool(Agent::Augment, "save-file"),
+            ToolClass::FileEdit
+        );
+        assert_eq!(
+            classify_tool(Agent::Augment, "str-replace-editor"),
+            ToolClass::FileEdit
+        );
+        assert_eq!(
+            classify_tool(Agent::Augment, "remove-files"),
+            ToolClass::FileEdit
+        );
+        assert_eq!(
+            classify_tool(Agent::Augment, "apply_patch"),
+            ToolClass::FileEdit
+        );
+        assert_eq!(
+            classify_tool(Agent::Augment, "launch-process"),
+            ToolClass::Bash
+        );
+        assert_eq!(classify_tool(Agent::Augment, "view"), ToolClass::Skip);
+        assert_eq!(
+            classify_tool(Agent::Augment, "grep-search"),
+            ToolClass::Skip
+        );
+        assert_eq!(classify_tool(Agent::Augment, "web-fetch"), ToolClass::Skip);
+        // Capitalized Claude-shaped names must NOT match (case differs);
+        // these are distinct from v2's lowercase names asserted below.
+        assert_eq!(classify_tool(Agent::Augment, "Write"), ToolClass::Skip);
+        assert_eq!(classify_tool(Agent::Augment, "Bash"), ToolClass::Skip);
+
+        // Augment v2 (auggie-v2 / cosmos-agent) tool names: lowercase,
+        // Claude-Code-shaped default toolset (CSS-2302).
+        assert_eq!(classify_tool(Agent::Augment, "write"), ToolClass::FileEdit);
+        assert_eq!(classify_tool(Agent::Augment, "edit"), ToolClass::FileEdit);
+        assert_eq!(classify_tool(Agent::Augment, "bash"), ToolClass::Bash);
+        assert_eq!(classify_tool(Agent::Augment, "read"), ToolClass::Skip);
     }
 
     #[test]

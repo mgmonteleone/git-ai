@@ -726,6 +726,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     #[serial]
     fn test_cline_partial_managed_install_is_detected_and_uninstalled() {
         with_temp_home(|home| {
@@ -758,6 +759,61 @@ mod tests {
             assert_eq!(
                 fs::read_to_string(ClineInstaller::hook_path(POST_HOOK_NAME)).unwrap(),
                 "#!/bin/sh\necho 'user hook'\n"
+            );
+        });
+    }
+
+    // Windows counterpart of `test_cline_partial_managed_install_is_detected_and_uninstalled`.
+    //
+    // Cline hooks are not supported on Windows today (see `ClineInstaller::check_hooks` /
+    // `is_windows`), so `check_hooks` intentionally reports `hooks_installed: false` even when a
+    // managed hook script is present on disk, and `uninstall_hooks` is a no-op that leaves any
+    // existing hook files untouched. This test asserts that honest unsupported-platform contract
+    // explicitly, rather than silently excluding Windows from coverage.
+    #[test]
+    #[cfg(windows)]
+    #[serial]
+    fn test_cline_partial_managed_install_is_unsupported_on_windows() {
+        with_temp_home(|home| {
+            let storage = home.join("cline-storage");
+            fs::create_dir_all(&storage).unwrap();
+            unsafe { std::env::set_var("GIT_AI_CLINE_STORAGE_PATH", &storage) };
+
+            fs::create_dir_all(ClineInstaller::hooks_dir()).unwrap();
+            let params = HookInstallerParams {
+                binary_path: create_test_binary_path(),
+            };
+            let managed_pre_content = ClineInstaller::generate_hook_script(&params.binary_path);
+            let unmanaged_post_content = "#!/bin/sh\necho 'user hook'\n";
+            fs::write(
+                ClineInstaller::hook_path(PRE_HOOK_NAME),
+                &managed_pre_content,
+            )
+            .unwrap();
+            fs::write(
+                ClineInstaller::hook_path(POST_HOOK_NAME),
+                unmanaged_post_content,
+            )
+            .unwrap();
+
+            let check = ClineInstaller.check_hooks(&params).unwrap();
+            assert!(check.tool_installed);
+            assert!(
+                !check.hooks_installed,
+                "Cline hooks are unsupported on Windows and must never be reported as installed"
+            );
+            assert!(!check.hooks_up_to_date);
+
+            let result = ClineInstaller.uninstall_hooks(&params, false).unwrap();
+            assert!(result.is_none(), "uninstall must be a no-op on Windows");
+            assert_eq!(
+                fs::read_to_string(ClineInstaller::hook_path(PRE_HOOK_NAME)).unwrap(),
+                managed_pre_content,
+                "Windows no-op uninstall must leave existing hook files untouched"
+            );
+            assert_eq!(
+                fs::read_to_string(ClineInstaller::hook_path(POST_HOOK_NAME)).unwrap(),
+                unmanaged_post_content
             );
         });
     }
