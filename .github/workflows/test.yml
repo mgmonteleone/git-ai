@@ -50,18 +50,9 @@ jobs:
       windows-enabled: ${{ steps.set-matrix.outputs.windows-enabled }}
     steps:
       - id: set-matrix
-        env:
-          # CSS-2302 PR1 exception: Windows test execution is intentionally
-          # disabled for this single fork pull request
-          # (mgmonteleone/git-ai#1) only. Native Windows daemon-await
-          # failures under this PR are unresolved (see PR description); this
-          # is a scoped skip, not a fix. It must NEVER apply to any other PR,
-          # to main, to merge_group, releases, or upstream repos. A dedicated
-          # follow-up PR removes this exception and restores Windows tests.
-          WINDOWS_TESTS_DISABLED_FOR_PR1: ${{ github.event_name == 'pull_request' && github.repository == 'mgmonteleone/git-ai' && github.event.pull_request.number == 1 }}
         run: |
           windows_enabled=true
-          if [ "${{ github.event_name }}" = "merge_group" ] || [ "$WINDOWS_TESTS_DISABLED_FOR_PR1" = "true" ]; then
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
             windows_enabled=false
           fi
 
@@ -483,9 +474,9 @@ jobs:
   windows-test-complete:
     name: Test on windows-latest
     needs: [compute-matrix, test]
-    # CSS-2302 PR1 exception: when Windows tests are disabled for this PR
-    # (see compute-matrix), there are no "Test on windows-latest *" jobs to
-    # aggregate; skip instead of failing on an absent-context mismatch.
+    # Windows tests are disabled for merge_group runs (see compute-matrix),
+    # so there are no "Test on windows-latest *" jobs to aggregate then;
+    # skip instead of failing on an absent-context mismatch.
     if: ${{ always() && github.event_name != 'merge_group' && needs.compute-matrix.outputs.windows-enabled == 'true' }}
     runs-on: ubuntu-latest
     steps:
