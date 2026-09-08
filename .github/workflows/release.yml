@@ -133,6 +133,8 @@ jobs:
             -e DEBIAN_FRONTEND=noninteractive \
             -e OSS_BUILD="1" \
             -e CARGO_INCREMENTAL="0" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
             ${{ matrix.docker_image }} \
             bash -c "
               set -euo pipefail
@@ -141,7 +143,8 @@ jobs:
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 --target ${{ matrix.target }} && \
               . \$HOME/.cargo/env && \
               cargo build --release --locked --target ${{ matrix.target }} && \
-              strip target/${{ matrix.target }}/release/git-ai
+              strip target/${{ matrix.target }}/release/git-ai && \
+              chown -R \"\$HOST_UID:\$HOST_GID\" target
             "
 
       - name: Install Rust toolchain (macOS)
