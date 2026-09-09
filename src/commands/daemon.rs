@@ -9,6 +9,8 @@ use crate::utils::LockFile;
 use crate::utils::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 #[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -387,6 +389,26 @@ fn spawn_daemon_run_detached(config: &DaemonConfig) -> Result<(), String> {
         // gives the child the same detachment from the parent's job/console
         // that `Start-Process` provided; `spawn_self_restart_process` below
         // uses this same direct-spawn pattern for the daemon's own restart.
+        //
+        // `Command::spawn` on Windows always requests `bInheritHandles = TRUE`
+        // (stable Rust 1.93 has no `CommandExt` knob for this -- the
+        // `inherit_handles` builder and the `ProcThreadAttributeList` /
+        // `raw_attribute` APIs needed for a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+        // allow-list are both still nightly-gated as of this writing, tracked
+        // by rust-lang/rust#146407 and #114854 respectively). That means
+        // *every* inheritable handle open in this process -- not just the
+        // three NUL handles wired up below for the child's own stdio -- gets
+        // duplicated into the detached daemon. If this process's own
+        // stdin/stdout/stderr are pipes owned by an installer or CI pipeline
+        // wrapper, those pipe handles leak into the daemon, which then
+        // outlives the wrapper: the write end of the pipe stays open and the
+        // wrapper hangs waiting for an EOF that never comes. Clearing
+        // `HANDLE_FLAG_INHERIT` on this process's own std handles closes that
+        // leak without touching the child's explicit `Stdio::null()` handles
+        // (freshly opened by `Command` with their own inheritable NUL handle,
+        // independent of ours), so `STARTF_USESTDHANDLES` for the child is
+        // unaffected.
+        disable_inherit_for_own_stdio();
         let preferred_flags =
             CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
         child.creation_flags(preferred_flags);
@@ -411,6 +433,52 @@ fn spawn_daemon_run_detached(config: &DaemonConfig) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         child.spawn().map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+/// Best-effort: clears `HANDLE_FLAG_INHERIT` on this process's own
+/// stdin/stdout/stderr handles so they are not duplicated into a
+/// subsequently spawned detached child.
+///
+/// `std::process::Command::spawn` on Windows unconditionally passes
+/// `bInheritHandles = TRUE` to `CreateProcessW` (stable Rust has no way to
+/// change that -- see the call site in `spawn_daemon_run_detached` above for
+/// why), which duplicates every inheritable handle in this process into the
+/// child, not only the handles this process explicitly wires up for the
+/// child's own stdio. This targets the specific handles most likely to be
+/// owned by an external wrapper (an installer script or CI pipeline
+/// invoking `git-ai`) rather than by this process itself, since those are
+/// the handles whose accidental leak into a long-lived daemon would keep
+/// the wrapper's own pipe open indefinitely.
+///
+/// Failures (e.g. a console handle, an already non-inheritable handle, or a
+/// missing standard handle) are ignored: this is a defense-in-depth
+/// mitigation, not a precondition for the daemon spawn to proceed.
+#[cfg(windows)]
+fn disable_inherit_for_own_stdio() {
+    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE};
+
+    let handles: [HANDLE; 3] = [
+        std::io::stdin().as_raw_handle() as HANDLE,
+        std::io::stdout().as_raw_handle() as HANDLE,
+        std::io::stderr().as_raw_handle() as HANDLE,
+    ];
+    for handle in handles {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: `handle` is a valid, open standard handle obtained from
+        // `AsRawHandle` on this process's own stdio; `SetHandleInformation`
+        // only mutates the handle's inheritance flag and cannot invalidate
+        // it for this process's own subsequent use.
+        let ok = unsafe {
+            windows_sys::Win32::Foundation::SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)
+        };
+        if ok == 0 {
+            tracing::debug!(
+                "failed to clear inherit flag on own stdio handle before detached daemon spawn"
+            );
+        }
     }
 }
 
