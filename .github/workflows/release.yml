@@ -35,6 +35,11 @@ on:
         required: false
         default: ''
         type: string
+      windows_pipe_probe:
+        description: 'CSS-2302 diagnostic (opt-in): run ONLY the bounded single Windows install-pipeline probe job instead of the candidate build matrix. Never combine with a normal candidate-build dispatch.'
+        required: false
+        default: false
+        type: boolean
 
 env:
   APPROVED_SOURCE_SHA: 39e16c218a11453ca37c13c60b535659ae69da65
@@ -43,6 +48,7 @@ env:
 jobs:
   build:
     name: Build candidate for ${{ matrix.target }}
+    if: ${{ inputs.windows_pipe_probe != true }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -299,3 +305,291 @@ jobs:
             artifacts/SHA256SUMS
             artifacts/manifest.json
           retention-days: 14
+
+  windows_pipe_probe:
+    # CSS-2302 bounded diagnostic (opt-in via workflow_dispatch inputs.windows_pipe_probe).
+    # Single Windows job only: no matrix, no candidate build/aggregate jobs, no
+    # publishing. Builds the PINNED PR head source (NOT the candidate SHA above,
+    # which is a stale/unrelated pin) and tests whether install.ps1's real
+    # `install-hooks --env | Out-Host` pipeline is released once this run's own
+    # spawned daemon (and only that daemon) is stopped. Read-only observation via
+    # standard PowerShell/.NET; no Sysinternals/handle-table tools, no test DB
+    # vars/feature flags to suppress the real daemon auto-spawn.
+    name: "CSS-2302 Windows install-pipeline probe (diagnostic, opt-in)"
+    if: ${{ inputs.windows_pipe_probe == true }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      PROBE_SOURCE_SHA: 1e175589ec1a554cf7270b1f9ca9a91e55aeab94
+      PROBE_SOURCE_TREE: a5ee1708f94d6a6b028fd4e191667b58042829c9
+    steps:
+      - name: Checkout probe source (pinned to approved diagnostic commit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 1e175589ec1a554cf7270b1f9ca9a91e55aeab94
+          persist-credentials: false
+
+      - name: Verify checked-out commit and tree against approved diagnostic constants
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          ACTUAL_TREE="$(git rev-parse 'HEAD^{tree}')"
+          echo "Actual HEAD:                $ACTUAL_SHA"
+          echo "Approved probe source SHA:  $PROBE_SOURCE_SHA"
+          echo "Actual tree:                $ACTUAL_TREE"
+          echo "Approved probe source tree: $PROBE_SOURCE_TREE"
+
+          if [[ "$ACTUAL_SHA" != "$PROBE_SOURCE_SHA" ]]; then
+            echo "::error::Checked-out HEAD ($ACTUAL_SHA) does not match the approved probe source SHA ($PROBE_SOURCE_SHA)"
+            exit 1
+          fi
+          if [[ "$ACTUAL_TREE" != "$PROBE_SOURCE_TREE" ]]; then
+            echo "::error::Checked-out tree ($ACTUAL_TREE) does not match the approved probe source tree ($PROBE_SOURCE_TREE)"
+            exit 1
+          fi
+
+      - name: Install Rust toolchain (Windows probe)
+        # Matches the toolchain already used by the real hanging E2E job
+        # (install-scripts-local-pr.yml's install-local-windows job uses
+        # `toolchain: stable`), not the release matrix's pinned 1.93.0 above,
+        # which is for an unrelated Linux/macOS candidate build.
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      - name: Build release binary (probe)
+        id: build
+        timeout-minutes: 10
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          OSS_BUILD: "1"
+        run: |
+          set -euo pipefail
+          rustc --version | tee /tmp/rustc_version.txt
+          cargo --version | tee /tmp/cargo_version.txt
+          cargo build --release --locked --bin git-ai
+          echo "PROBE_RUSTC_VERSION=$(cat /tmp/rustc_version.txt)" >> "$GITHUB_ENV"
+          echo "PROBE_CARGO_VERSION=$(cat /tmp/cargo_version.txt)" >> "$GITHUB_ENV"
+
+      - name: Record built binary provenance
+        if: always() && steps.build.outcome == 'success'
+        shell: pwsh
+        run: |
+          $bin = Join-Path $env:GITHUB_WORKSPACE 'target\release\git-ai.exe'
+          if (-not (Test-Path -LiteralPath $bin)) { throw "built binary missing: $bin" }
+          $resolvedBin = (Resolve-Path -LiteralPath $bin).Path
+          $hash = (Get-FileHash -LiteralPath $resolvedBin -Algorithm SHA256).Hash
+          Add-Content -Path $env:GITHUB_ENV -Value "BIN_PATH=$resolvedBin"
+          Add-Content -Path $env:GITHUB_ENV -Value "BIN_SHA256=$hash"
+          Write-Host "Built binary: $resolvedBin"
+          Write-Host "SHA256: $hash"
+          & $resolvedBin --version
+          Write-Host "PowerShell version: $($PSVersionTable.PSVersion)"
+          Write-Host "Runner image: $env:ImageOS $env:ImageVersion"
+
+      - name: Run install pipeline probe (Windows, isolated HOME)
+        id: probe
+        if: always()
+        shell: pwsh
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ($env:BUILD_OUTCOME -ne 'success') {
+            $result = [ordered]@{
+              conclusion    = 'inconclusive_build_did_not_succeed'
+              build_outcome = $env:BUILD_OUTCOME
+            }
+            $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'probe-result.json')
+            Write-Host ($result | ConvertTo-Json)
+            exit 0
+          }
+
+          # --- Duplicated from install.ps1 (Normalize-PathString / Get-GitAiManagedProcesses). ---
+          # install.ps1 is a standalone bootstrap script, not an importable module
+          # (dot-sourcing it would execute the real installer at file scope), so
+          # its exact, already-reviewed ownership-detection helpers are
+          # reproduced verbatim here rather than re-derived, per repo convention
+          # to reuse existing tested logic instead of inventing new heuristics.
+          function Normalize-PathString {
+              param([Parameter(Mandatory = $true)][string]$Path)
+              try {
+                  return ([IO.Path]::GetFullPath($Path.Trim())).TrimEnd('\').ToLowerInvariant()
+              } catch {
+                  return ($Path.Trim()).TrimEnd('\').ToLowerInvariant()
+              }
+          }
+
+          function Get-GitAiManagedProcesses {
+              param([Parameter(Mandatory = $true)][string]$InstallDir)
+              $targetPaths = @(
+                  (Normalize-PathString (Join-Path $InstallDir 'git-ai.exe')),
+                  (Normalize-PathString (Join-Path $InstallDir 'git.exe'))
+              )
+              return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                  $_.ProcessId -ne $PID -and
+                  $_.ExecutablePath -and
+                  ($targetPaths -contains (Normalize-PathString $_.ExecutablePath))
+              })
+          }
+          # --- end duplicated helpers ---
+
+          $testHome = Join-Path $env:RUNNER_TEMP 'git-ai-probe-home'
+          New-Item -ItemType Directory -Force -Path $testHome | Out-Null
+          $homeDrive = [System.IO.Path]::GetPathRoot($testHome).TrimEnd('\')
+          $homePath = $testHome.Substring($homeDrive.Length)
+          $installDir = Join-Path $testHome '.git-ai\bin'
+
+          $repoRoot = $env:GITHUB_WORKSPACE
+          $markerPath = Join-Path $testHome 'probe-install-complete.marker'
+          $wrapperScript = Join-Path $testHome 'run-install.ps1'
+
+          # Wrapper runs the REAL, unmodified install.ps1 (same script the E2E
+          # job uses) in its OWN pwsh.exe child process, so the exact production
+          # `install-hooks --env | Out-Host` pipe is exercised there while this
+          # controlling script bound-waits / inspects / kills from outside
+          # without disturbing it. A completion marker is written immediately
+          # after install.ps1 returns, distinguishing "script logic completed"
+          # from "outer process merely still alive".
+          # Built as a joined line array (not a here-string) because a
+          # here-string's closing `"@` must sit at column 0, which would
+          # break this YAML block scalar's required indentation.
+          $wrapperLines = @(
+              "`$ErrorActionPreference = 'Stop'",
+              "Set-Location '$repoRoot'",
+              "Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force",
+              "& '$repoRoot\install.ps1'",
+              "`$exitCode = `$LASTEXITCODE",
+              "([ordered]@{",
+              "  completed_utc = (Get-Date).ToUniversalTime().ToString('o')",
+              "  install_ps1_last_exit_code = `$exitCode",
+              "} | ConvertTo-Json) | Set-Content -LiteralPath '$markerPath'"
+          )
+          ($wrapperLines -join "`n") | Set-Content -LiteralPath $wrapperScript -Encoding utf8
+
+          $env:HOME = $testHome
+          $env:USERPROFILE = $testHome
+          $env:HOMEDRIVE = $homeDrive
+          $env:HOMEPATH = $homePath
+          $env:GIT_AI_LOCAL_BINARY = $env:BIN_PATH
+
+          $probeStart = Get-Date
+          $pwshExe = (Get-Command pwsh).Source
+          $wrapperProc = Start-Process -FilePath $pwshExe -ArgumentList @('-NoLogo', '-NoProfile', '-File', $wrapperScript) -PassThru
+
+          $hangWaitSeconds = 240
+          $deadline = $probeStart.AddSeconds($hangWaitSeconds)
+          while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $markerPath) -and -not $wrapperProc.HasExited) {
+              Start-Sleep -Seconds 5
+          }
+
+          $markerFoundBeforeKill = Test-Path -LiteralPath $markerPath
+          $wrapperExitedBeforeKill = $wrapperProc.HasExited
+
+          $result = [ordered]@{
+              probe_start_utc            = $probeStart.ToUniversalTime().ToString('o')
+              hang_wait_seconds          = $hangWaitSeconds
+              marker_found_before_kill   = $markerFoundBeforeKill
+              wrapper_exited_before_kill = $wrapperExitedBeforeKill
+              daemon_candidate_count     = 0
+              daemon_killed              = $false
+              daemon_kill_verified_exit  = $false
+              marker_found_after_kill    = $false
+              wrapper_exited_after_kill  = $false
+              conclusion                 = 'inconclusive'
+              rustc_version              = $env:PROBE_RUSTC_VERSION
+              cargo_version              = $env:PROBE_CARGO_VERSION
+              pwsh_version               = $PSVersionTable.PSVersion.ToString()
+              built_binary_sha256        = $env:BIN_SHA256
+              source_sha                 = $env:PROBE_SOURCE_SHA
+              source_tree                = $env:PROBE_SOURCE_TREE
+          }
+
+          if (-not $markerFoundBeforeKill -and -not $wrapperExitedBeforeKill) {
+              # Stalled. Identify our own just-spawned daemon: exact resolved
+              # path under this job's OWN isolated install dir (unambiguous,
+              # since $testHome is unique to this run), further narrowed to
+              # processes created after this probe started.
+              $candidates = @(Get-GitAiManagedProcesses -InstallDir $installDir | Where-Object { $_.CreationDate -gt $probeStart })
+              $result.daemon_candidate_count = $candidates.Count
+
+              if ($candidates.Count -eq 1) {
+                  $daemonPid = [int]$candidates[0].ProcessId
+                  try {
+                      $daemonProc = [System.Diagnostics.Process]::GetProcessById($daemonPid)
+                      $daemonProc.Kill($true)
+                      $result.daemon_killed = $true
+                      $result.daemon_kill_verified_exit = [bool]$daemonProc.WaitForExit(30000)
+                  } catch {
+                      $result.daemon_killed = $false
+                  }
+
+                  $postKillDeadline = (Get-Date).AddSeconds(45)
+                  while ((Get-Date) -lt $postKillDeadline -and -not (Test-Path -LiteralPath $markerPath) -and -not $wrapperProc.HasExited) {
+                      Start-Sleep -Seconds 3
+                  }
+                  $result.marker_found_after_kill   = Test-Path -LiteralPath $markerPath
+                  $result.wrapper_exited_after_kill = $wrapperProc.HasExited
+
+                  if ($result.marker_found_after_kill -or $result.wrapper_exited_after_kill) {
+                      $result.conclusion = 'daemon_lifetime_release_observed'
+                  } else {
+                      $result.conclusion = 'still_stalled_after_daemon_kill'
+                  }
+              } else {
+                  # Zero or multiple candidates: ownership is not unambiguous.
+                  # Do NOT kill anything; report inconclusive instead.
+                  $result.conclusion = 'inconclusive_ambiguous_daemon_ownership'
+              }
+          } else {
+              $result.conclusion = 'no_hang_observed'
+          }
+
+          Add-Content -Path $env:GITHUB_ENV -Value "WRAPPER_PID=$($wrapperProc.Id)"
+
+          $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $repoRoot 'probe-result.json')
+          $result | ConvertTo-Json -Depth 5 | Write-Host
+
+      - name: Stop probe daemon and wrapper (best-effort cleanup)
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $testHome = Join-Path $env:RUNNER_TEMP 'git-ai-probe-home'
+          $installDir = Join-Path $testHome '.git-ai\bin'
+          $gitAiExe = Join-Path $installDir 'git-ai.exe'
+
+          # Same graceful-shutdown pattern already used by the existing E2E
+          # Windows job (install-scripts-local-pr.yml "Stop installed daemon
+          # (Windows)" step), scoped to this job's own isolated install dir.
+          if (Test-Path -LiteralPath $gitAiExe) {
+              $env:HOME = $testHome
+              $env:USERPROFILE = $testHome
+              & $gitAiExe bg shutdown --hard 2>&1 | Out-Null
+              $global:LASTEXITCODE = 0
+          }
+
+          # Kill the wrapper pwsh.exe child process by the exact PID this job
+          # itself captured from Start-Process, if it is still running.
+          if ($env:WRAPPER_PID) {
+              try {
+                  $wrapperProc = Get-Process -Id ([int]$env:WRAPPER_PID) -ErrorAction SilentlyContinue
+                  if ($wrapperProc -and -not $wrapperProc.HasExited) {
+                      $wrapperProc.Kill($true)
+                  }
+              } catch {}
+          }
+
+      - name: Upload probe result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-pipe-probe-result
+          path: probe-result.json
+          retention-days: 14
+          if-no-files-found: warn
