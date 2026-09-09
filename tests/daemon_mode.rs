@@ -3929,6 +3929,98 @@ fn daemon_windows_trace_pipe_worker_exhaustion_does_not_block_later_trace_connec
     );
 }
 
+/// Bounded, non-blocking poll for a child's exit: unlike `Child::wait`, this
+/// cannot hang the test if the wrapper itself never exits. Uses only
+/// `try_wait` + `sleep` (no additional thread/join), mirroring the polling
+/// cadence `DaemonGuard::wait_until_ready` already uses elsewhere in this
+/// file.
+#[cfg(windows)]
+fn wait_for_child_bounded(
+    child: &mut Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("failed to poll `git-ai bg start` wrapper status")
+        {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// RAII safety net for the detached daemon spawned by this fixture's
+/// `git-ai bg start` wrapper: without this, a panic anywhere in the test
+/// body (a bounded-wait timeout on the wrapper, a non-retryable wrapper
+/// failure, a missed EOF, or a failed liveness ping) would strand a daemon
+/// with a 24h max-uptime instead of tearing it down. Runs on unwind as well
+/// as on the ordinary success path, so it covers a daemon that started
+/// successfully even when something *after* the spawn fails.
+///
+/// Cleanup is itself bounded: send a graceful `Shutdown` and poll the
+/// control socket for up to 2s, falling back to a kill targeted at this
+/// daemon's own, positively-identified PID (via `read_daemon_pid`, mirroring
+/// production's `hard_kill_daemon` on Windows) -- never an image-name or
+/// other broad process kill.
+#[cfg(windows)]
+struct BgStartDaemonCleanup {
+    control_socket_path: PathBuf,
+    daemon_home: PathBuf,
+}
+
+#[cfg(windows)]
+impl BgStartDaemonCleanup {
+    fn new(control_socket_path: PathBuf, daemon_home: PathBuf) -> Self {
+        Self {
+            control_socket_path,
+            daemon_home,
+        }
+    }
+
+    fn shutdown_bounded(&self) {
+        // Best-effort: the wrapper may have failed before the daemon ever
+        // started, so an unreachable socket here is not itself an error.
+        let _ = send_control_request(&self.control_socket_path, &ControlRequest::Shutdown);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if local_socket_connects_with_timeout(
+                &self.control_socket_path,
+                DAEMON_TEST_PROBE_TIMEOUT,
+            )
+            .is_err()
+            {
+                return; // Control socket is down: the daemon has exited.
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // Still reachable after the graceful window: fall back to a
+        // PID-targeted kill of exactly this daemon (never a global/image-name
+        // kill). `DaemonConfig::from_home` deterministically reproduces the
+        // same `lock_path` (and thus pid-metadata path) the daemon itself
+        // computed from the `GIT_AI_DAEMON_HOME` env var we gave the wrapper.
+        let config = DaemonConfig::from_home(&self.daemon_home);
+        if let Ok(pid) = read_daemon_pid(&config) {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .output();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for BgStartDaemonCleanup {
+    fn drop(&mut self) {
+        self.shutdown_bounded();
+    }
+}
+
 /// CSS-2302 regression: `spawn_daemon_run_detached`'s `Command::spawn` on
 /// Windows unconditionally requests `bInheritHandles = TRUE` (stable Rust
 /// 1.93 has no `CommandExt` knob to change that), so *every* inheritable
@@ -3950,6 +4042,13 @@ fn daemon_windows_trace_pipe_worker_exhaustion_does_not_block_later_trace_connec
 fn daemon_windows_bg_start_wrapper_stdout_closes_promptly_while_daemon_stays_up() {
     let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
     let control_socket = daemon_control_socket_path(&repo);
+
+    // Established before the wrapper is even spawned: a daemon that starts
+    // successfully must be cleaned up even if the wrapper's bounded wait
+    // times out or a later assertion in this function panics, not only on
+    // the explicit success-path shutdown at the bottom of this function.
+    let _daemon_cleanup =
+        BgStartDaemonCleanup::new(control_socket.clone(), repo.daemon_home_path());
 
     // Retries only a `STATUS_DLL_INIT_FAILED`-class wrapper exit (a hosted
     // Windows-runner loader hiccup, not a daemon defect) -- see
@@ -3981,10 +4080,15 @@ fn daemon_windows_bg_start_wrapper_stdout_closes_promptly_while_daemon_stays_up(
             .spawn()
             .expect("failed to spawn `git-ai bg start` wrapper");
         let mut wrapper_stdout = wrapper.stdout.take().expect("wrapper stdout was not piped");
+        let mut wrapper_stderr = wrapper.stderr.take().expect("wrapper stderr was not piped");
 
         // Drain the wrapper's stdout on a background thread so our own read
         // never blocks the wrapper on a full pipe buffer; the thread reports
-        // when it observes EOF.
+        // when it observes EOF. Never joined -- only observed via a bounded
+        // `recv_timeout` below -- so a still-blocked reader (the exact
+        // regression this test targets) cannot itself hang the test; its
+        // lifetime is bounded instead by `_daemon_cleanup` tearing down the
+        // daemon that would otherwise be holding the pipe open.
         let (eof_tx, eof_rx) = mpsc::channel();
         thread::spawn(move || {
             let mut sink = Vec::new();
@@ -3992,9 +4096,33 @@ fn daemon_windows_bg_start_wrapper_stdout_closes_promptly_while_daemon_stays_up(
             let _ = eof_tx.send(());
         });
 
-        let wrapper_status = wrapper
-            .wait()
-            .expect("failed to wait for `git-ai bg start` wrapper");
+        // Drain stderr concurrently for the same reason (a full stderr pipe
+        // would otherwise block the wrapper independent of the stdout-leak
+        // regression under test) and to capture useful diagnostics on
+        // failure below.
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = wrapper_stderr.read_to_end(&mut sink);
+            let _ = stderr_tx.send(String::from_utf8_lossy(&sink).into_owned());
+        });
+
+        // Bounded wait for the wrapper's own exit. On timeout, terminate and
+        // reap the exact owned wrapper (never a broader kill); stdout/stderr
+        // are already draining above, and `_daemon_cleanup` (established
+        // above, before this spawn) still tears down any daemon the wrapper
+        // managed to start before hanging.
+        let wrapper_status = match wait_for_child_bounded(&mut wrapper, Duration::from_secs(15)) {
+            Some(status) => status,
+            None => {
+                let _ = wrapper.kill();
+                let reaped = wrapper.wait();
+                panic!(
+                    "`git-ai bg start` wrapper did not exit within the bounded wait; killed and reaped: {:?}",
+                    reaped
+                );
+            }
+        };
         if !wrapper_status.success() {
             if is_windows_loader_init_failure(&wrapper_status) {
                 attempt += 1;
@@ -4006,9 +4134,12 @@ fn daemon_windows_bg_start_wrapper_stdout_closes_promptly_while_daemon_stays_up(
                     continue;
                 }
             }
+            let stderr = stderr_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_default();
             panic!(
-                "`git-ai bg start` wrapper exited with failure: {:?}",
-                wrapper_status
+                "`git-ai bg start` wrapper exited with failure: {:?}\nstderr:\n{}",
+                wrapper_status, stderr
             );
         }
 
@@ -4025,7 +4156,9 @@ fn daemon_windows_bg_start_wrapper_stdout_closes_promptly_while_daemon_stays_up(
     }
 
     // The daemon itself must still be alive and reachable here: stopping it
-    // below is cleanup, never part of the success assertion above.
+    // below is cleanup, never part of the success assertion above. Killing
+    // the daemon is never what makes this assertion pass -- `_daemon_cleanup`
+    // has not touched it yet (it only acts on drop, after this point).
     let ping = send_control_request(&control_socket, &ControlRequest::Ping)
         .expect("daemon control socket should be reachable after `bg start`");
     assert!(
