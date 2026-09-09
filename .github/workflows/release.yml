@@ -40,15 +40,22 @@ on:
         required: false
         default: false
         type: boolean
+      windows_regression_validation:
+        description: 'CSS-2302 validation (opt-in): run ONLY the bounded single Windows job that compiles the daemon_mode test target and executes exactly the daemon_windows_bg_start_wrapper_stdout_closes_promptly_while_daemon_stays_up regression against the pinned validation candidate commit below. Never combine with a normal candidate-build dispatch or with windows_pipe_probe.'
+        required: false
+        default: false
+        type: boolean
 
 env:
   APPROVED_SOURCE_SHA: 39e16c218a11453ca37c13c60b535659ae69da65
   APPROVED_SOURCE_TREE: cd141a19f9d37dbc8a271532f86a9c58a55960d5
+  VALIDATION_CANDIDATE_SHA: 43341ba4f2443c424d89aa2aaab166063b0659f3
+  VALIDATION_CANDIDATE_TREE: 5addd36208ba24be5bbd37635d105809aff49141
 
 jobs:
   build:
     name: Build candidate for ${{ matrix.target }}
-    if: ${{ inputs.windows_pipe_probe != true }}
+    if: ${{ inputs.windows_pipe_probe != true && inputs.windows_regression_validation != true }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -593,3 +600,128 @@ jobs:
           path: probe-result.json
           retention-days: 14
           if-no-files-found: warn
+
+  windows_regression_validation:
+    # CSS-2302 bounded validation (opt-in via workflow_dispatch
+    # inputs.windows_regression_validation). Single Windows job only: no
+    # matrix, no candidate build/aggregate jobs, no publishing. Checks out the
+    # immutable pinned validation candidate commit (NOT this helper branch's
+    # head and NOT the source branch head) and executes exactly one named
+    # regression test to confirm it compiles and passes on native Windows.
+    name: "CSS-2302 Windows regression validation (single test, opt-in)"
+    if: ${{ inputs.windows_regression_validation == true }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout validation candidate (pinned to approved candidate commit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 43341ba4f2443c424d89aa2aaab166063b0659f3
+          persist-credentials: false
+
+      - name: Verify checked-out commit and tree against approved candidate constants
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          ACTUAL_TREE="$(git rev-parse 'HEAD^{tree}')"
+          echo "Actual HEAD:                   $ACTUAL_SHA"
+          echo "Approved validation candidate: $VALIDATION_CANDIDATE_SHA"
+          echo "Actual tree:                   $ACTUAL_TREE"
+          echo "Approved candidate tree:       $VALIDATION_CANDIDATE_TREE"
+
+          if [[ "$ACTUAL_SHA" != "$VALIDATION_CANDIDATE_SHA" ]]; then
+            echo "::error::Checked-out HEAD ($ACTUAL_SHA) does not match the approved validation candidate SHA ($VALIDATION_CANDIDATE_SHA)"
+            exit 1
+          fi
+          if [[ "$ACTUAL_TREE" != "$VALIDATION_CANDIDATE_TREE" ]]; then
+            echo "::error::Checked-out tree ($ACTUAL_TREE) does not match the approved validation candidate tree ($VALIDATION_CANDIDATE_TREE)"
+            exit 1
+          fi
+
+      - name: Install Rust toolchain (Windows validation)
+        # Matches the toolchain already used by windows_pipe_probe above
+        # (`toolchain: stable`), not the release matrix's pinned 1.93.0,
+        # which is for an unrelated Linux/macOS candidate build.
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      - name: Install Task
+        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2
+
+      - name: Record toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          task --version
+
+      - name: Compile daemon_mode target and assert exactly one filtered test is selected
+        id: list
+        timeout-minutes: 14
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -euo pipefail
+          TEST_NAME="daemon_windows_bg_start_wrapper_stdout_closes_promptly_while_daemon_stays_up"
+          task test \
+            CARGO_TEST_ARGS="--test daemon_mode" \
+            TEST_FILTER="$TEST_NAME" \
+            EXTRA_TEST_BINARY_ARGS="--exact --list" \
+            | tee list-output.txt
+          MATCH_COUNT="$(grep -c -- "^${TEST_NAME}: test$" list-output.txt || true)"
+          echo "Matched test count: $MATCH_COUNT"
+          if [[ "$MATCH_COUNT" != "1" ]]; then
+            echo "::error::Expected exactly 1 selected test named $TEST_NAME, got $MATCH_COUNT"
+            exit 1
+          fi
+
+      - name: Execute the single named regression
+        id: run_test
+        timeout-minutes: 4
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -euo pipefail
+          TEST_NAME="daemon_windows_bg_start_wrapper_stdout_closes_promptly_while_daemon_stays_up"
+          set +e
+          task test \
+            CARGO_TEST_ARGS="--test daemon_mode" \
+            TEST_FILTER="$TEST_NAME" \
+            EXTRA_TEST_BINARY_ARGS="--exact" \
+            | tee run-output.txt
+          TASK_EXIT="${PIPESTATUS[0]}"
+          set -e
+          echo "task test exit code: $TASK_EXIT"
+
+          RESULT_LINE="$(grep -E "^test result: " run-output.txt || true)"
+          echo "Result line: $RESULT_LINE"
+          if [[ ! "$RESULT_LINE" =~ ^test\ result:\ ok\.\ 1\ passed\;\ 0\ failed\;\ 0\ ignored\; ]]; then
+            echo "::error::Expected exactly 'test result: ok. 1 passed; 0 failed; 0 ignored; ...', got: $RESULT_LINE"
+            exit 1
+          fi
+          if [[ "$TASK_EXIT" != "0" ]]; then
+            echo "::error::task test exited $TASK_EXIT despite a matching result line"
+            exit 1
+          fi
+          echo "native_result=pass" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### CSS-2302 Windows regression validation"
+            echo "- Candidate SHA: $VALIDATION_CANDIDATE_SHA"
+            echo "- Candidate tree: $VALIDATION_CANDIDATE_TREE"
+            echo "- List step outcome: ${{ steps.list.outcome }}"
+            echo "- Run step outcome: ${{ steps.run_test.outcome }}"
+            echo "- Native result: ${{ steps.run_test.outputs.native_result || 'not-pass' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
