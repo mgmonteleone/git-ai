@@ -3954,6 +3954,32 @@ fn wait_for_child_bounded(
     }
 }
 
+/// Bounded, non-blocking reap for a child that has already been asked to
+/// terminate (e.g. via `kill()`): unlike `Child::wait`, this cannot hang if
+/// the child never actually exits. Unlike `wait_for_child_bounded`, a
+/// `try_wait` polling error is itself reported rather than panicking --
+/// callers reaping after a kill (in a timeout or `Drop` cleanup path) must
+/// never fall back to a blocking `wait()`, so a poll error is just another
+/// bounded-reap failure to surface.
+#[cfg(windows)]
+fn reap_child_bounded(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(e) => return Err(format!("try_wait failed while reaping: {e}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("bounded reap window elapsed without observing exit".to_string());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// RAII safety net for the detached daemon spawned by this fixture's
 /// `git-ai bg start` wrapper: without this, a panic anywhere in the test
 /// body (a bounded-wait timeout on the wrapper, a non-retryable wrapper
@@ -4005,11 +4031,63 @@ impl BgStartDaemonCleanup {
         // kill). `DaemonConfig::from_home` deterministically reproduces the
         // same `lock_path` (and thus pid-metadata path) the daemon itself
         // computed from the `GIT_AI_DAEMON_HOME` env var we gave the wrapper.
+        //
+        // `Command::output()` would block indefinitely on a hung `taskkill`,
+        // which runs from `Drop` and must never hang or panic. Spawn it
+        // instead so its own wait is bounded: a stuck `taskkill` gets killed
+        // and reaped on its own bounded timeout, and every failure mode
+        // (spawn, wait, non-zero exit) is reported rather than assumed away.
+        // Finally, don't just trust `taskkill`'s exit -- give the control
+        // socket a short bounded window to actually stop responding before
+        // giving up.
         let config = DaemonConfig::from_home(&self.daemon_home);
         if let Ok(pid) = read_daemon_pid(&config) {
-            let _ = Command::new("taskkill")
+            match Command::new("taskkill")
                 .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output();
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(mut taskkill) => match reap_child_bounded(&mut taskkill, Duration::from_secs(2))
+                {
+                    Ok(status) if !status.success() => {
+                        eprintln!("[test-harness] taskkill /PID {pid} exited non-zero: {status:?}");
+                    }
+                    Ok(_) => {}
+                    Err(reap_err) => {
+                        eprintln!(
+                            "[test-harness] taskkill /PID {pid} did not exit within the bounded wait ({reap_err}); killing it directly"
+                        );
+                        let _ = taskkill.kill();
+                        if let Err(post_kill_err) =
+                            reap_child_bounded(&mut taskkill, Duration::from_millis(500))
+                        {
+                            eprintln!(
+                                "[test-harness] failed to reap taskkill for PID {pid} after killing it: {post_kill_err}"
+                            );
+                        }
+                    }
+                },
+                Err(spawn_err) => {
+                    eprintln!("[test-harness] failed to spawn taskkill for PID {pid}: {spawn_err}");
+                }
+            }
+
+            let dead_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while std::time::Instant::now() < dead_deadline {
+                if local_socket_connects_with_timeout(
+                    &self.control_socket_path,
+                    DAEMON_TEST_PROBE_TIMEOUT,
+                )
+                .is_err()
+                {
+                    return; // Control socket is down: the daemon has exited.
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!(
+                "[test-harness] daemon (pid {pid}) still reachable after bounded taskkill teardown; giving up without a further unbounded wait"
+            );
         }
     }
 }
@@ -4115,11 +4193,16 @@ fn daemon_windows_bg_start_wrapper_stdout_closes_promptly_while_daemon_stays_up(
         let wrapper_status = match wait_for_child_bounded(&mut wrapper, Duration::from_secs(15)) {
             Some(status) => status,
             None => {
-                let _ = wrapper.kill();
-                let reaped = wrapper.wait();
+                // Preserve the kill outcome instead of discarding it, and
+                // reap with a second bounded poll rather than a blocking
+                // `wait()` -- a wrapper that ignores the kill signal must
+                // not be able to hang this failure path too. `_daemon_cleanup`
+                // still runs via unwind below, giving the daemon itself a
+                // bounded teardown attempt before this failure surfaces.
+                let kill_result = wrapper.kill();
+                let reaped = reap_child_bounded(&mut wrapper, Duration::from_secs(2));
                 panic!(
-                    "`git-ai bg start` wrapper did not exit within the bounded wait; killed and reaped: {:?}",
-                    reaped
+                    "`git-ai bg start` wrapper did not exit within the bounded wait; kill result: {kill_result:?}; bounded reap result: {reaped:?}"
                 );
             }
         };
