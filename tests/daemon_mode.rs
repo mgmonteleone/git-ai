@@ -201,6 +201,7 @@ struct MockApiServer {
     stop: Arc<AtomicBool>,
     rx: mpsc::Receiver<Value>,
     thread: Option<thread::JoinHandle<()>>,
+    accepted_rx: mpsc::Receiver<()>,
 }
 
 impl MockApiServer {
@@ -211,6 +212,7 @@ impl MockApiServer {
             .expect("failed to set nonblocking listener");
         let addr = listener.local_addr().expect("failed to read listener addr");
         let (tx, rx) = mpsc::channel();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
 
@@ -218,7 +220,27 @@ impl MockApiServer {
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        handle_http_connection(stream, &tx);
+                        // Handle each connection on its own thread rather than
+                        // inline: the accept loop previously processed one
+                        // connection fully (including its own read timeout)
+                        // before accepting the next, so two genuinely
+                        // concurrent uploads (e.g. a periodic metrics flush
+                        // racing an awaited notes flush) serialized behind
+                        // each other. Under slower/contended schedulers
+                        // (observed on Windows CI runners) that head-of-line
+                        // blocking can push a second request's own read past
+                        // its timeout, producing a spurious upload failure
+                        // that then sits in the daemon's multi-minute retry
+                        // backoff (CSS-2302).
+                        //
+                        // Signal genuine acceptance (this listener actually
+                        // dequeued the connection) before spawning the
+                        // handler, so tests that need to prove a specific
+                        // slow-then-fast connection ordering can wait on a
+                        // real event instead of a fixed sleep heuristic.
+                        let _ = accepted_tx.send(());
+                        let tx = tx.clone();
+                        thread::spawn(move || handle_http_connection(stream, &tx));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -233,11 +255,24 @@ impl MockApiServer {
             stop,
             rx,
             thread: Some(thread),
+            accepted_rx,
         }
     }
 
     fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Blocks until the accept loop has genuinely accepted (dequeued) a new
+    /// connection, or panics if none arrives within `timeout`. Unlike a
+    /// fixed sleep, this proves the server has actually observed that
+    /// specific connection -- e.g. to establish a deterministic slow-then-fast
+    /// ordering in a concurrency regression -- rather than merely hoping a
+    /// sleep duration was long enough (CSS-2302 review follow-up).
+    fn wait_for_next_accept(&self, timeout: Duration) {
+        self.accepted_rx
+            .recv_timeout(timeout)
+            .expect("mock API server did not accept a new connection within the timeout");
     }
 
     /// Collect all requests captured by the mock so far.
@@ -388,6 +423,85 @@ fn write_http_response(stream: &mut TcpStream, body: &[u8]) {
         .write_all(body)
         .expect("failed to write mock API response body");
     stream.flush().expect("failed to flush mock API response");
+}
+
+/// Regression for the head-of-line blocking that used to live in
+/// `MockApiServer`'s accept loop (CSS-2302): each accepted connection was
+/// handled fully inline before the loop went back to `accept()`, so a slow
+/// sender (e.g. a client stalled by scheduler contention) delayed even an
+/// unrelated, already-connected client's response until the slow one's own
+/// 2s read timeout elapsed. That head-of-line delay is exactly the kind of
+/// transient failure window that pushes a metrics/notes upload into the
+/// daemon's multi-minute retry backoff, which `git-ai await` then correctly
+/// (and by design) reports as still-outstanding -- see
+/// `await_reports_backed_off_and_exhausted_metrics_as_outstanding`. Windows
+/// CI runners are more prone to exactly this kind of scheduling delay than
+/// Linux/macOS, which is consistent with the historically Windows-only
+/// failures on `await_waits_for_metrics_and_notes_flush`,
+/// `excluded_repo_token_usage_never_uploads_via_the_real_pipeline`, and
+/// `reingest_command_redelivers_bounded_and_all_metrics_through_daemon`.
+///
+/// This test fails on the pre-fix (inline, serial) `MockApiServer` because a
+/// fast, already-connected second client is forced to wait out the slow
+/// first client's full read timeout before it is even accepted.
+#[test]
+fn mock_api_server_does_not_head_of_line_block_concurrent_requests() {
+    let mock_api = MockApiServer::start();
+    let addr = mock_api
+        .base_url()
+        .trim_start_matches("http://")
+        .to_string();
+
+    // Slow client: connect immediately, but don't send any request bytes
+    // until well past the server's 2s per-connection read timeout.
+    let slow_addr = addr.clone();
+    let slow_client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(&slow_addr).expect("slow client connect failed");
+        thread::sleep(Duration::from_millis(2_500));
+        let _ = write_json_post(&mut stream, "/worker/metrics/upload", "{}");
+    });
+
+    // Block until the mock server's accept loop has genuinely accepted the
+    // slow client's connection -- not a fixed sleep heuristic -- before the
+    // fast client even connects. Since the fast client has not connected
+    // yet, this accept event can only be the slow client's, deterministically
+    // establishing the slow-then-fast ordering the regression depends on.
+    mock_api.wait_for_next_accept(Duration::from_secs(2));
+
+    // Fast client: connects after the slow one and sends its request right
+    // away. It must not be blocked behind the slow client.
+    let fast_start = std::time::Instant::now();
+    let mut fast_stream = TcpStream::connect(&addr).expect("fast client connect failed");
+    let fast_response = write_json_post(&mut fast_stream, "/worker/metrics/upload", "{}")
+        .expect("fast client should receive a response");
+    let fast_elapsed = fast_start.elapsed();
+
+    assert!(
+        fast_elapsed < Duration::from_millis(1_500),
+        "fast client waited {:?} for a response; a concurrent slow sender must not \
+         head-of-line block it (mock API accept loop is not per-connection)",
+        fast_elapsed
+    );
+    assert!(
+        fast_response.contains("errors"),
+        "expected the mock metrics-upload response, got: {fast_response}"
+    );
+
+    slow_client.join().expect("slow client thread panicked");
+}
+
+/// Send a minimal HTTP/1.1 POST and return the response body as a string.
+fn write_json_post(stream: &mut TcpStream, path: &str, body: &str) -> Option<String> {
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok();
+    Some(String::from_utf8_lossy(&response).into_owned())
 }
 
 fn configure_test_home_env(command: &mut Command, test_home: &Path) {
@@ -3813,6 +3927,330 @@ fn daemon_windows_trace_pipe_worker_exhaustion_does_not_block_later_trace_connec
     panic!(
         "daemon did not process a later trace connection after every original pipe worker was stalled"
     );
+}
+
+/// Bounded, non-blocking poll for a child's exit: unlike `Child::wait`, this
+/// cannot hang the test if the wrapper itself never exits. Uses only
+/// `try_wait` + `sleep` (no additional thread/join), mirroring the polling
+/// cadence `DaemonGuard::wait_until_ready` already uses elsewhere in this
+/// file.
+#[cfg(windows)]
+fn wait_for_child_bounded(
+    child: &mut Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("failed to poll `git-ai bg start` wrapper status")
+        {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Bounded, non-blocking reap for a child that has already been asked to
+/// terminate (e.g. via `kill()`): unlike `Child::wait`, this cannot hang if
+/// the child never actually exits. Unlike `wait_for_child_bounded`, a
+/// `try_wait` polling error is itself reported rather than panicking --
+/// callers reaping after a kill (in a timeout or `Drop` cleanup path) must
+/// never fall back to a blocking `wait()`, so a poll error is just another
+/// bounded-reap failure to surface.
+#[cfg(windows)]
+fn reap_child_bounded(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(e) => return Err(format!("try_wait failed while reaping: {e}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("bounded reap window elapsed without observing exit".to_string());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// RAII safety net for the detached daemon spawned by this fixture's
+/// `git-ai bg start` wrapper: without this, a panic anywhere in the test
+/// body (a bounded-wait timeout on the wrapper, a non-retryable wrapper
+/// failure, a missed EOF, or a failed liveness ping) would strand a daemon
+/// with a 24h max-uptime instead of tearing it down. Runs on unwind as well
+/// as on the ordinary success path, so it covers a daemon that started
+/// successfully even when something *after* the spawn fails.
+///
+/// Cleanup is itself bounded: send a graceful `Shutdown` and poll the
+/// control socket for up to 2s, falling back to a kill targeted at this
+/// daemon's own, positively-identified PID (via `read_daemon_pid`, mirroring
+/// production's `hard_kill_daemon` on Windows) -- never an image-name or
+/// other broad process kill.
+#[cfg(windows)]
+struct BgStartDaemonCleanup {
+    control_socket_path: PathBuf,
+    daemon_home: PathBuf,
+}
+
+#[cfg(windows)]
+impl BgStartDaemonCleanup {
+    fn new(control_socket_path: PathBuf, daemon_home: PathBuf) -> Self {
+        Self {
+            control_socket_path,
+            daemon_home,
+        }
+    }
+
+    fn shutdown_bounded(&self) {
+        // Best-effort: the wrapper may have failed before the daemon ever
+        // started, so an unreachable socket here is not itself an error.
+        let _ = send_control_request(&self.control_socket_path, &ControlRequest::Shutdown);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if local_socket_connects_with_timeout(
+                &self.control_socket_path,
+                DAEMON_TEST_PROBE_TIMEOUT,
+            )
+            .is_err()
+            {
+                return; // Control socket is down: the daemon has exited.
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // Still reachable after the graceful window: fall back to a
+        // PID-targeted kill of exactly this daemon (never a global/image-name
+        // kill). `DaemonConfig::from_home` deterministically reproduces the
+        // same `lock_path` (and thus pid-metadata path) the daemon itself
+        // computed from the `GIT_AI_DAEMON_HOME` env var we gave the wrapper.
+        //
+        // `Command::output()` would block indefinitely on a hung `taskkill`,
+        // which runs from `Drop` and must never hang or panic. Spawn it
+        // instead so its own wait is bounded: a stuck `taskkill` gets killed
+        // and reaped on its own bounded timeout, and every failure mode
+        // (spawn, wait, non-zero exit) is reported rather than assumed away.
+        // Finally, don't just trust `taskkill`'s exit -- give the control
+        // socket a short bounded window to actually stop responding before
+        // giving up.
+        let config = DaemonConfig::from_home(&self.daemon_home);
+        if let Ok(pid) = read_daemon_pid(&config) {
+            match Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(mut taskkill) => match reap_child_bounded(&mut taskkill, Duration::from_secs(2))
+                {
+                    Ok(status) if !status.success() => {
+                        eprintln!("[test-harness] taskkill /PID {pid} exited non-zero: {status:?}");
+                    }
+                    Ok(_) => {}
+                    Err(reap_err) => {
+                        eprintln!(
+                            "[test-harness] taskkill /PID {pid} did not exit within the bounded wait ({reap_err}); killing it directly"
+                        );
+                        let _ = taskkill.kill();
+                        if let Err(post_kill_err) =
+                            reap_child_bounded(&mut taskkill, Duration::from_millis(500))
+                        {
+                            eprintln!(
+                                "[test-harness] failed to reap taskkill for PID {pid} after killing it: {post_kill_err}"
+                            );
+                        }
+                    }
+                },
+                Err(spawn_err) => {
+                    eprintln!("[test-harness] failed to spawn taskkill for PID {pid}: {spawn_err}");
+                }
+            }
+
+            let dead_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while std::time::Instant::now() < dead_deadline {
+                if local_socket_connects_with_timeout(
+                    &self.control_socket_path,
+                    DAEMON_TEST_PROBE_TIMEOUT,
+                )
+                .is_err()
+                {
+                    return; // Control socket is down: the daemon has exited.
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!(
+                "[test-harness] daemon (pid {pid}) still reachable after bounded taskkill teardown; giving up without a further unbounded wait"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for BgStartDaemonCleanup {
+    fn drop(&mut self) {
+        self.shutdown_bounded();
+    }
+}
+
+/// CSS-2302 regression: `spawn_daemon_run_detached`'s `Command::spawn` on
+/// Windows unconditionally requests `bInheritHandles = TRUE` (stable Rust
+/// 1.93 has no `CommandExt` knob to change that), so *every* inheritable
+/// handle open in the wrapper process -- not only the three NUL handles
+/// wired up for the daemon's own stdio -- would be duplicated into the
+/// newly spawned, long-lived daemon absent the `disable_inherit_for_own_stdio`
+/// mitigation. When the wrapper's own stdout is a pipe (as it is for an
+/// installer script or a CI pipeline step invoking `git-ai`), a leaked
+/// write-end handle keeps that pipe open long after the wrapper exits,
+/// hanging any reader waiting for EOF -- the "outer wrapper alive" symptom
+/// from the native probe.
+///
+/// This exercises the real production spawn path via `git-ai bg start`
+/// (`ensure_daemon_running_attached` -> `spawn_daemon_run_detached`), not a
+/// daemon started through `DaemonGuard` (which spawns `bg run` directly with
+/// null stdio and never goes through `spawn_daemon_run_detached`).
+#[test]
+#[cfg(windows)]
+fn daemon_windows_bg_start_wrapper_stdout_closes_promptly_while_daemon_stays_up() {
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    let control_socket = daemon_control_socket_path(&repo);
+
+    // Established before the wrapper is even spawned: a daemon that starts
+    // successfully must be cleaned up even if the wrapper's bounded wait
+    // times out or a later assertion in this function panics, not only on
+    // the explicit success-path shutdown at the bottom of this function.
+    let _daemon_cleanup =
+        BgStartDaemonCleanup::new(control_socket.clone(), repo.daemon_home_path());
+
+    // Retries only a `STATUS_DLL_INIT_FAILED`-class wrapper exit (a hosted
+    // Windows-runner loader hiccup, not a daemon defect) -- see
+    // `is_windows_loader_init_failure`. Any other wrapper failure is a hard
+    // failure below.
+    let mut attempt = 0;
+    loop {
+        let mut command = Command::new(get_binary_path());
+        command
+            .arg("bg")
+            .arg("start")
+            .current_dir(repo.path())
+            .env("GIT_AI_TEST_DB_PATH", repo.test_db_path())
+            .env("GITAI_TEST_DB_PATH", repo.test_db_path())
+            .env("GIT_AI_DAEMON_UPDATE_CHECK_INTERVAL", "86400")
+            .env("GIT_AI_DAEMON_MAX_UPTIME_SECS", "86400")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_test_home_env(&mut command, repo.test_home_path());
+        configure_test_daemon_env(
+            &mut command,
+            &repo.daemon_home_path(),
+            &control_socket,
+            &daemon_trace_socket_path(&repo),
+        );
+
+        let mut wrapper = command
+            .spawn()
+            .expect("failed to spawn `git-ai bg start` wrapper");
+        let mut wrapper_stdout = wrapper.stdout.take().expect("wrapper stdout was not piped");
+        let mut wrapper_stderr = wrapper.stderr.take().expect("wrapper stderr was not piped");
+
+        // Drain the wrapper's stdout on a background thread so our own read
+        // never blocks the wrapper on a full pipe buffer; the thread reports
+        // when it observes EOF. Never joined -- only observed via a bounded
+        // `recv_timeout` below -- so a still-blocked reader (the exact
+        // regression this test targets) cannot itself hang the test; its
+        // lifetime is bounded instead by `_daemon_cleanup` tearing down the
+        // daemon that would otherwise be holding the pipe open.
+        let (eof_tx, eof_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = wrapper_stdout.read_to_end(&mut sink);
+            let _ = eof_tx.send(());
+        });
+
+        // Drain stderr concurrently for the same reason (a full stderr pipe
+        // would otherwise block the wrapper independent of the stdout-leak
+        // regression under test) and to capture useful diagnostics on
+        // failure below.
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = wrapper_stderr.read_to_end(&mut sink);
+            let _ = stderr_tx.send(String::from_utf8_lossy(&sink).into_owned());
+        });
+
+        // Bounded wait for the wrapper's own exit. On timeout, terminate and
+        // reap the exact owned wrapper (never a broader kill); stdout/stderr
+        // are already draining above, and `_daemon_cleanup` (established
+        // above, before this spawn) still tears down any daemon the wrapper
+        // managed to start before hanging.
+        let wrapper_status = match wait_for_child_bounded(&mut wrapper, Duration::from_secs(15)) {
+            Some(status) => status,
+            None => {
+                // Preserve the kill outcome instead of discarding it, and
+                // reap with a second bounded poll rather than a blocking
+                // `wait()` -- a wrapper that ignores the kill signal must
+                // not be able to hang this failure path too. `_daemon_cleanup`
+                // still runs via unwind below, giving the daemon itself a
+                // bounded teardown attempt before this failure surfaces.
+                let kill_result = wrapper.kill();
+                let reaped = reap_child_bounded(&mut wrapper, Duration::from_secs(2));
+                panic!(
+                    "`git-ai bg start` wrapper did not exit within the bounded wait; kill result: {kill_result:?}; bounded reap result: {reaped:?}"
+                );
+            }
+        };
+        if !wrapper_status.success() {
+            if is_windows_loader_init_failure(&wrapper_status) {
+                attempt += 1;
+                if attempt < DAEMON_SPAWN_LOADER_RETRY_ATTEMPTS {
+                    eprintln!(
+                        "[test-harness] `bg start` wrapper loader init failed (attempt {}/{}), retrying",
+                        attempt, DAEMON_SPAWN_LOADER_RETRY_ATTEMPTS
+                    );
+                    continue;
+                }
+            }
+            let stderr = stderr_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_default();
+            panic!(
+                "`git-ai bg start` wrapper exited with failure: {:?}\nstderr:\n{}",
+                wrapper_status, stderr
+            );
+        }
+
+        // The wrapper process has already exited. If its stdout pipe's write
+        // end leaked into the detached daemon, this would hang until the
+        // daemon itself exits (bounded only by the outer test-suite timeout).
+        // This bounded wait is the actual regression check -- it must observe
+        // EOF promptly, not merely eventually.
+        eof_rx.recv_timeout(Duration::from_secs(5)).expect(
+            "wrapper's stdout pipe did not reach EOF promptly after the wrapper exited -- \
+             a handle likely leaked into the detached daemon",
+        );
+        break;
+    }
+
+    // The daemon itself must still be alive and reachable here: stopping it
+    // below is cleanup, never part of the success assertion above. Killing
+    // the daemon is never what makes this assertion pass -- `_daemon_cleanup`
+    // has not touched it yet (it only acts on drop, after this point).
+    let ping = send_control_request(&control_socket, &ControlRequest::Ping)
+        .expect("daemon control socket should be reachable after `bg start`");
+    assert!(
+        ping.ok,
+        "daemon should report ok after `bg start`: {:?}",
+        ping
+    );
+
+    let _ = send_control_request(&control_socket, &ControlRequest::Shutdown);
 }
 
 #[test]
@@ -8304,13 +8742,6 @@ fn trace_queue_full_drop_logs_the_dropped_root() {
 }
 
 #[test]
-// CSS-2302: temporary Windows-only quarantine; the await/metrics-flush failure
-// cause on Windows CI is unconfirmed (not proven flaky). Re-enable once the
-// root cause is diagnosed/fixed and a native Windows run passes.
-#[cfg_attr(
-    windows,
-    ignore = "CSS-2302: temporary quarantine, cause unconfirmed; re-enable after root cause fix + native Windows validation passes"
-)]
 fn await_waits_for_metrics_and_notes_flush() {
     let mut mock_api = MockApiServer::start();
 
@@ -8840,13 +9271,6 @@ fn token_usage_without_repo_url_passes_an_exclude_only_gate() {
 /// nothing crosses the wire. (The upload-time gate above is defense layer 2,
 /// for sessions tracked BEFORE a repo was excluded.)
 #[test]
-// CSS-2302: temporary Windows-only quarantine; the failure cause on Windows CI
-// is unconfirmed (not proven flaky). Re-enable once the root cause is
-// diagnosed/fixed and a native Windows run passes.
-#[cfg_attr(
-    windows,
-    ignore = "CSS-2302: temporary quarantine, cause unconfirmed; re-enable after root cause fix + native Windows validation passes"
-)]
 fn excluded_repo_token_usage_never_uploads_via_the_real_pipeline() {
     let mut mock_api = MockApiServer::start();
     let metrics_db_path = std::env::temp_dir().join(format!(

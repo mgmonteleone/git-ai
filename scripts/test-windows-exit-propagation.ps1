@@ -17,9 +17,9 @@
     scenario.
 
     Scenarios exercised against the candidate (current HEAD) script:
-      1. core `task test` fails               -> exit code propagates, and
-                                                   the doc-test task is never
-                                                   invoked.
+      1. core `task test` fails               -> the doc-test task still
+                                                   runs, and the core's
+                                                   exit code propagates.
       2. core passes, doc-test `task test` fails -> exit code propagates.
       3. both succeed                          -> exit code 0.
 
@@ -568,9 +568,9 @@ try {
     $candidateWorkDir = Join-Path $tempRoot "candidate"
     New-Item -ItemType Directory -Path $candidateWorkDir -Force | Out-Null
 
-    Test-Scenario -Name "candidate: core failure blocks doc-test and propagates exit code" `
+    Test-Scenario -Name "candidate: core failure still runs doc-test and propagates core's exit code" `
         -ScriptBody $candidateBody -WorkDir $candidateWorkDir `
-        -CoreExitCode 17 -DocExitCode 0 -ExpectedExitCode 17 -ExpectedCallCount 1 -ExpectDocCallSkipped
+        -CoreExitCode 17 -DocExitCode 0 -ExpectedExitCode 17 -ExpectedCallCount 2
 
     Test-Scenario -Name "candidate: doc-test failure propagates after core success" `
         -ScriptBody $candidateBody -WorkDir $candidateWorkDir `

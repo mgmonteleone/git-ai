@@ -50,18 +50,9 @@ jobs:
       windows-enabled: ${{ steps.set-matrix.outputs.windows-enabled }}
     steps:
       - id: set-matrix
-        env:
-          # CSS-2302 PR1 exception: Windows test execution is intentionally
-          # disabled for this single fork pull request
-          # (mgmonteleone/git-ai#1) only. Native Windows daemon-await
-          # failures under this PR are unresolved (see PR description); this
-          # is a scoped skip, not a fix. It must NEVER apply to any other PR,
-          # to main, to merge_group, releases, or upstream repos. A dedicated
-          # follow-up PR removes this exception and restores Windows tests.
-          WINDOWS_TESTS_DISABLED_FOR_PR1: ${{ github.event_name == 'pull_request' && github.repository == 'mgmonteleone/git-ai' && github.event.pull_request.number == 1 }}
         run: |
           windows_enabled=true
-          if [ "${{ github.event_name }}" = "merge_group" ] || [ "$WINDOWS_TESTS_DISABLED_FOR_PR1" = "true" ]; then
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
             windows_enabled=false
           fi
 
@@ -284,7 +275,18 @@ jobs:
 
           $mode = $env:MATRIX_MODE
           if ($mode -eq "windows-core") {
-            $testTargets = @("--lib", "--bins")
+            # --no-fail-fast (CSS-2302 review follow-up): this single `cargo
+            # test` invocation covers every top-level test binary (--lib,
+            # --bins, and one --test per file under tests/, e.g. daemon_mode,
+            # windows_install_script, windows_msi_package,
+            # notes_sync_regression). Cargo's default is to stop after the
+            # FIRST failing test executable and skip the rest -- so an earlier
+            # failure (e.g. daemon_mode) would silently skip later targets
+            # (e.g. the install/MSI/notes ones) instead of running them. This
+            # flag makes cargo run every requested target to completion
+            # regardless of earlier failures; `cargo test`'s own exit code is
+            # still nonzero if ANY target failed.
+            $testTargets = @("--no-fail-fast", "--lib", "--bins")
             Get-ChildItem -Path "tests" -Filter "*.rs" -File |
               Sort-Object Name |
               ForEach-Object {
@@ -292,18 +294,28 @@ jobs:
               }
 
             task test CARGO_TEST_ARGS="$($testTargets -join ' ')" TEST_THREADS="$env:MATRIX_TEST_THREADS"
-            if ($LASTEXITCODE -ne 0) {
-              # $ErrorActionPreference = "Stop" does not stop the script on a
-              # non-zero exit code from a native command (only on PowerShell
-              # cmdlet/terminating errors), so a failing `task test` here would
-              # otherwise fall through to the doc-test run below and its exit
-              # code, silently discarding this failure. Capture and propagate
-              # the native exit code immediately instead of masking it.
-              exit $LASTEXITCODE
-            }
+            # $ErrorActionPreference = "Stop" does not stop the script on a
+            # non-zero exit code from a native command (only on PowerShell
+            # cmdlet/terminating errors), so $LASTEXITCODE must be captured
+            # immediately -- before any other command can overwrite it -- or a
+            # failing run here would silently be lost. Unlike the previous
+            # immediate `exit`, the doc-test run below always executes next: a
+            # core-target failure must not skip doc tests, and the aggregate
+            # check below still fails the job if either run did.
+            $coreExitCode = $LASTEXITCODE
 
             task test CARGO_TEST_ARGS="--doc" TEST_THREADS="$env:MATRIX_TEST_THREADS"
-            exit $LASTEXITCODE
+            $docExitCode = $LASTEXITCODE
+
+            if ($coreExitCode -ne 0) {
+              Write-Host "windows-core aggregate failure (core exit=$coreExitCode, doc exit=$docExitCode)"
+              exit $coreExitCode
+            }
+            if ($docExitCode -ne 0) {
+              Write-Host "windows-core aggregate failure (core exit=$coreExitCode, doc exit=$docExitCode)"
+              exit $docExitCode
+            }
+            exit 0
           }
 
           if ($mode -ne "windows-integration") {
@@ -483,9 +495,9 @@ jobs:
   windows-test-complete:
     name: Test on windows-latest
     needs: [compute-matrix, test]
-    # CSS-2302 PR1 exception: when Windows tests are disabled for this PR
-    # (see compute-matrix), there are no "Test on windows-latest *" jobs to
-    # aggregate; skip instead of failing on an absent-context mismatch.
+    # Windows tests are disabled for merge_group runs (see compute-matrix),
+    # so there are no "Test on windows-latest *" jobs to aggregate then;
+    # skip instead of failing on an absent-context mismatch.
     if: ${{ always() && github.event_name != 'merge_group' && needs.compute-matrix.outputs.windows-enabled == 'true' }}
     runs-on: ubuntu-latest
     steps:
