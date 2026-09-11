@@ -23,12 +23,12 @@ on:
       expected_source_sha:
         description: 'Cross-checked against the literal approved constant; the literal constant always wins.'
         required: false
-        default: '39e16c218a11453ca37c13c60b535659ae69da65'
+        default: '8d7fd65464f1f99bea4368d6e588d0a5bcd93a05'
         type: string
       expected_source_tree:
         description: 'Cross-checked against the literal approved constant; the literal constant always wins.'
         required: false
-        default: 'cd141a19f9d37dbc8a271532f86a9c58a55960d5'
+        default: '5addd36208ba24be5bbd37635d105809aff49141'
         type: string
       expected_helper_sha:
         description: 'Optional: expected commit SHA of this helper-branch workflow file (github.sha). Validated separately from source SHA/tree.'
@@ -47,8 +47,8 @@ on:
         type: boolean
 
 env:
-  APPROVED_SOURCE_SHA: 39e16c218a11453ca37c13c60b535659ae69da65
-  APPROVED_SOURCE_TREE: cd141a19f9d37dbc8a271532f86a9c58a55960d5
+  APPROVED_SOURCE_SHA: 8d7fd65464f1f99bea4368d6e588d0a5bcd93a05
+  APPROVED_SOURCE_TREE: 5addd36208ba24be5bbd37635d105809aff49141
   VALIDATION_CANDIDATE_SHA: 43341ba4f2443c424d89aa2aaab166063b0659f3
   VALIDATION_CANDIDATE_TREE: 5addd36208ba24be5bbd37635d105809aff49141
 
@@ -90,7 +90,7 @@ jobs:
       - name: Checkout candidate source (pinned to approved commit)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 39e16c218a11453ca37c13c60b535659ae69da65
+          ref: 8d7fd65464f1f99bea4368d6e588d0a5bcd93a05
           persist-credentials: false
 
       - name: Verify checked-out commit and tree against approved constants
